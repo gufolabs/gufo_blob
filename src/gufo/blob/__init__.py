@@ -17,5 +17,5 @@ storage implementation.
 * [async backends][gufo.blob.aio]: Async mode.
 """
 
-__version__: str = "0.0.1"
+__version__: str = "0.1.0"
 __all__ = ["__version__"]
