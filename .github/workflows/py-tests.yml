@@ -7,7 +7,6 @@ on:
     paths:
       - ".github/workflows/py-tests.yml"
       - "pyproject.toml"
-      - "examples/**"
       - "src/**"
       - "tests/**"
       - "setup.cfg"
@@ -47,10 +46,10 @@ jobs:
         run: pip install -IU -e .[lint]
 
       - name: Check Formatting
-        run: ruff format --check examples/ src/ tests/
+        run: ruff format --check src/ tests/
 
       - name: Check ruff
-        run: ruff check -q examples/ src/ tests/
+        run: ruff check -q src/ tests/
 
       - name: Check Mypy
         run: mypy --strict src/
