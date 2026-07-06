@@ -1,0 +1,12 @@
+syntax: glob
+.*
+!.gitignore
+!.devcontainer/
+!.github/
+*.pyc
+*.pyo
+build/
+dist/
+*.egg-info/
+*.dist-info/
+__pycache__

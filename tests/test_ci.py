@@ -1,0 +1,81 @@
+# ---------------------------------------------------------------------
+# Gufo Labs: CI test
+# ---------------------------------------------------------------------
+# Copyright (C) 2022-23, Gufo Labs
+# See LICENSE.md for details
+# ---------------------------------------------------------------------
+
+# Python modules
+import inspect
+import os
+import sys
+from collections.abc import Iterable
+from dataclasses import dataclass
+
+# Third-party modules
+import pytest
+import yaml
+
+
+def _get_root() -> str:
+    mod_path = inspect.getfile(sys.modules[__name__])
+    rel_root = os.path.dirname(mod_path)
+    return os.path.abspath(os.path.join(rel_root, ".."))
+
+
+VERSIONS = [
+    "actions/cache@v5",
+    "actions/checkout@v6",
+    "actions/setup-python@v6",
+    "actions/download-artifact@v8",
+    "actions/upload-artifact@v7",
+    "pypa/gh-action-pypi-publish@release/v1",
+]
+
+
+@dataclass
+class Action:
+    path: str
+    job: str
+    step: str
+    action: str
+    version: str
+    expected: str
+
+
+def action_label(action: Action) -> str:
+    return f"{action.path}: {action.job}/{action.step}: {action.action}"
+
+
+def _iter_actions() -> Iterable[Action]:
+    versions = {a.split("@")[0]: a.split("@")[1] for a in VERSIONS}
+    root = os.path.join(_get_root(), ".github", "workflows")
+    for fn in os.listdir(root):
+        if fn.startswith(".") or not fn.endswith(".yml"):
+            continue
+        path = os.path.join(root, fn)
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        for job in data["jobs"]:
+            for step in data["jobs"][job]["steps"]:
+                if "uses" in step:
+                    uses = step["uses"]
+                    for v, expected in versions.items():
+                        if uses.startswith(f"{v}@"):
+                            yield Action(
+                                path=fn,
+                                job=job,
+                                step=step["name"],
+                                action=v,
+                                version=uses.split("@")[1],
+                                expected=expected,
+                            )
+                            break
+
+
+@pytest.mark.parametrize("action", list(_iter_actions()), ids=action_label)
+def test_actions(action: Action) -> None:
+    loc = f"{action.path}: {action.job}/{action.step}"
+    v_exp = f"{action.action}@{action.expected}"
+    msg = f"{loc}: {v_exp} required (@{action.version} used)"
+    assert action.version == action.expected, msg
