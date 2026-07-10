@@ -16,6 +16,10 @@ To see unreleased changes, please see the [CHANGELOG on the master branch](https
 
 * `ftp` backend.
 
+### Infrastructure
+
+* Set up python tests in devcontainer
+
 ## 0.1.0 - 2026-07-06
 
 ### Added
