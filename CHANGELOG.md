@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 To see unreleased changes, please see the [CHANGELOG on the master branch](https://github.com/gufolabs/gufo_blob/blob/master/CHANGELOG.md) guide.
 
+## [Unreleased]
+
+### Added
+
+* `ftp` backend.
+
 ## 0.1.0 - 2026-07-06
 
 ### Added

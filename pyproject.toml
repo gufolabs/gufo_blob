@@ -159,6 +159,7 @@ test = [
   "pytest-cov==7.0.0",
   "pytest==9.1.1",
   "pytest-asyncio==1.4.0",
+  "pyftpdlib==2.2.0",
 ]
 
 [project.readme]

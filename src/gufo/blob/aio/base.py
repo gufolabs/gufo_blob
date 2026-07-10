@@ -53,6 +53,9 @@ class BlobBase(ABC):
 
         Returns:
             `**kwargs` for constructor.
+
+        Raises:
+            BlobError: on error.
         """
 
     @classmethod

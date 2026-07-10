@@ -1,0 +1,753 @@
+# ---------------------------------------------------------------------
+# Gufo Blob: FTP backend (sync, passive mode only)
+# ---------------------------------------------------------------------
+# Copyright (C) 2026, Gufo Labs
+# ---------------------------------------------------------------------
+
+"""FTPBlob implementation."""
+
+# Python modules
+from __future__ import annotations
+
+import random
+import re
+import socket
+import time
+from collections.abc import Callable, Iterable
+from contextlib import suppress
+from dataclasses import dataclass
+from functools import cached_property
+from typing import Any
+from urllib.parse import unquote, urlparse
+
+# Gufo Blob modules
+from ..error import BlobError
+from ..utils import bytes_to_int_range, bytes_to_octet
+from .base import BlobBase
+
+# FTP reply codes
+FTP_TRANSFER_READY = 125
+FTP_TRANSFER_ALREADY_OPEN = 150
+FTP_OK = 200
+FTP_STATUS = 211
+FTP_SIZE_OK = 213
+FTP_READY = 220
+FTP_TRANSFER_DONE = 226
+FTP_PASV = 227
+FTP_LOGIN_OK = 230
+FTP_ACTION_OK = 250
+FTP_CREATED = 257
+FTP_USER_OK = 331
+FTP_UNAVAILABLE = 421
+FTP_NOT_FOUND = 550
+
+DEFAULT_USER = "anonymous"
+DEFAULT_PASSWORD = "anonymous@"  # noqa:S105
+
+RETRY_RANGE = 0.2  # +- 10% of retry timeout
+CRLF = b"\r\n"
+RECV_SIZE = 65536
+MIN_FTP_RESPONSE = 4
+
+rx_pasv = re.compile(rb"\((\d+,\d+,\d+,\d+,\d+,\d+)\)")
+rx_unix_perm = re.compile(rb"[\-d]([\-r][\-w][\-x]){3}")
+
+
+@dataclass
+class FTPFeatures:
+    """
+    FTP Server features.
+
+    Attributes:
+        supports_mlsd: MLSD command is supported.
+        supports_mlst: MLST command is supported.
+        supports_size: SIZE command is supported.
+    """
+
+    supports_mlsd: bool = False
+    supports_mlst: bool = False
+    supports_size: bool = False
+
+    @classmethod
+    def from_feat(cls, feat: list[bytes]) -> FTPFeatures:
+        """
+        Parse FEAT response.
+
+        Args:
+            feat: Feat response from FTP server
+
+        Returns:
+            Parsed FTPFeatures.
+        """
+        features = cls()
+        for line in feat:
+            parts = line.split()
+            match parts[0].upper():
+                case b"MLSD":
+                    features.supports_mlst = True  # assumed with MLSD
+                    features.supports_mlsd = True
+                case b"SIZE":
+                    features.supports_size = True
+                case _:
+                    pass
+        return features
+
+
+class FTPBlob(BlobBase):
+    """
+    FTP-based synchronous blob storage.
+
+    This backend stores objects as files on a remote FTP server using
+    standard passive mode (PASV). The object key is used directly as the
+    remote file path relative to the configured root directory.
+
+    The implementation is intentionally minimal and supports only the
+    subset of FTP commands required by the Blob API:
+
+    * USER/PASS
+    * PASV
+    * RETR
+    * STOR
+    * DELE
+    * CWD
+    * QUIT
+
+    Additional commands may be optionally used when supported by server:
+
+    * MLSD
+    * MLST
+    * SIZE
+
+    Only passive mode is supported. Active mode (PORT/EPRT), TLS (FTPS),
+    and resume operations (REST) are not implemented.
+
+    All sockets use configurable timeouts to avoid indefinite blocking.
+
+    The backend assumes that keys are valid FTP path names and does not
+    perform any path normalization beyond using the configured root
+    directory.
+
+    Args:
+        host: FTP host.
+        port: FTP port.
+        user: FTP user.
+        password: FTP password.
+        root: root directory.
+        timeout: connection and operation timeout in seconds.
+        retries: number of connection retries.
+        retry_timeout: retry timeout in seconds.
+        features: set FTPFeatures explicitly.
+    """
+
+    name = "ftp"
+
+    def __init__(  # noqa: PLR0913
+        self,
+        host: str,
+        port: int = 21,
+        user: str = DEFAULT_USER,
+        password: str = DEFAULT_PASSWORD,
+        root: str = "",
+        timeout: float = 30.0,
+        retries: int = 3,
+        retry_timeout: float = 1.0,
+        features: FTPFeatures | None = None,
+    ) -> None:
+        self._host = host
+        self._port = port
+        self._user = user
+        self._password = password
+        self._root = root.strip("/")
+        self._timeout = timeout
+        self._retries = retries
+        self._retry_timeout = retry_timeout
+        self._sock: socket.socket | None = None
+        self._recv_size = RECV_SIZE
+        self._pending_features = features
+        self._response_buffer = b""
+
+    @classmethod
+    def parse_url(cls, url: str) -> dict[str, Any]:
+        """
+        Parse URL and extract parameters for constructor.
+
+        Args:
+            url: URL to parse.
+
+        Returns:
+            `**kwargs` for constructor.
+        """
+        u = urlparse(url)
+        if not u.hostname:
+            msg = "hostname not set"
+            raise BlobError(msg)
+        return {
+            "host": u.hostname,
+            "port": u.port or 21,
+            "user": unquote(u.username or "anonymous"),
+            "password": unquote(u.password or "anonymous@"),
+            "root": u.path.strip("/"),
+        }
+
+    def open(self) -> None:
+        """
+        Perform connection routines when necessary.
+
+        Raises:
+            BlobError: on error
+        """
+        _ = self.connection  # Force connection
+
+    def close(self) -> None:
+        """Perform cleanup routines when necessary."""
+        try:
+            if self._sock:
+                with suppress(BlobError):
+                    self._cmd("QUIT")
+                with suppress(OSError):
+                    self._sock.close()
+        finally:
+            self._sock = None
+
+    @property
+    def connection(self) -> socket.socket:
+        """
+        Get connected socket.
+
+        Returns:
+            Connected socket which passes login.
+
+        Raises:
+            BlobError: on error.
+        """
+        if not self._sock:
+            self._sock = self._connect()
+            try:
+                self._login()
+            except BlobError:
+                with suppress(OSError):
+                    self._sock.close()
+                self._sock = None
+                raise
+        return self._sock
+
+    def _connect(self) -> socket.socket:
+        """
+        Connect to FTP server.
+
+        Returns:
+            connected socket.
+
+        Raises:
+            BlobError: on error.
+        """
+        last_error: str | None = ""
+        for _ in range(self._retries):
+            try:
+                return socket.create_connection(
+                    (self._host, self._port),
+                    timeout=self._timeout,
+                )
+            except TimeoutError as e:
+                last_error = f"FTP connection timeout: {e}"
+            except ConnectionRefusedError as e:
+                last_error = f"FTP connection refused: {e}"
+            except OSError as e:
+                last_error = f"FTP OS error during connect: {e}"
+            offset = RETRY_RANGE * (random.random() - 0.5)  # noqa:S311 not a crypto
+            time.sleep(self._retry_timeout * (1.0 + offset))
+        msg = f"failed to connect after {self._retries}: {last_error}"
+        raise BlobError(msg)
+
+    def _login(self) -> None:
+        """
+        Perform login sequence.
+
+        Raises:
+            BlobError: on login failed.
+        """
+        self._expect(FTP_READY)
+        # Process USER
+        code, _ = self._cmd(f"USER {self._user}")
+        if code == FTP_USER_OK:
+            code, _ = self._cmd(f"PASS {self._password}")
+        if code != FTP_LOGIN_OK:
+            msg = f"LOGIN failed: {code}"
+            raise BlobError(msg)
+        if self._root:
+            code, _ = self._cmd(f"CWD /{self._root}")
+            if code != FTP_ACTION_OK:
+                msg = f"CWD /{self._root} failed: {code}"
+                raise BlobError(msg)
+        # Set binary (image) transfer mode for all subsequent data operations
+        code, _ = self._cmd("TYPE I")
+        if code != FTP_OK:
+            msg = f"Failed to set binary transfer mode: {code}"
+            raise BlobError(msg)
+
+    def _read_response(self) -> tuple[int, list[bytes]]:
+        """
+        Read a complete FTP server response.
+
+        Supports both single-line and multi-line responses as defined by
+        RFC 959. For multi-line responses, reading continues until the
+        terminating line with the same reply code followed by a space.
+
+        Returns:
+            A tuple containing:
+
+            * FTP reply code.
+            * List of response lines without trailing CRLF.
+
+        Raises:
+            BlobError: If the connection is closed, the response is
+                malformed, or a network error occurs.
+        """
+
+        def read_line() -> bytes:
+            """
+            Read socket or buffer until CRLF.
+
+            Returns:
+                Line with stripped CRLF.
+            """
+            while True:
+                line, crlf, rest = self._response_buffer.partition(CRLF)
+                if crlf == CRLF:
+                    self._response_buffer = rest
+                    return line
+                try:
+                    data = self.connection.recv(self._recv_size)
+                except TimeoutError as e:
+                    msg = "timed out"
+                    raise BlobError(msg) from e
+                except OSError as e:
+                    msg = f"OS error: {e}"
+                    raise BlobError(msg) from e
+                if not data:
+                    msg = "server closed connection"
+                    raise BlobError(msg)
+                self._response_buffer = (
+                    self._response_buffer + data
+                    if self._response_buffer
+                    else data
+                )
+
+        lines: list[bytes] = [read_line()]
+        first = lines[0]
+        if len(first) < MIN_FTP_RESPONSE:
+            msg = "response too short"
+            raise BlobError(msg)
+        code = bytes_to_int_range(first[:3], min_value=0, max_value=999)
+        if first[3:4] == b"-":  # multi-line
+            while True:
+                line = read_line()
+                lines.append(line)
+                if (
+                    len(line) >= MIN_FTP_RESPONSE
+                    and line[:3] == first[:3]
+                    and line[3:4] == b" "
+                ):
+                    break
+        return code, lines
+
+    def _cmd(self, cmd: str) -> tuple[int, list[bytes]]:
+        """
+        Send an FTP command and read the server response.
+
+        The command is transmitted over the control connection with the
+        required CRLF terminator. The complete server response is then read
+        and returned.
+
+        Args:
+            cmd: FTP command without the trailing CRLF.
+
+        Returns:
+            A tuple containing:
+
+            * FTP reply code.
+            * List of response lines without trailing CRLF.
+
+        Raises:
+            BlobError: If the control connection is not established or a
+                network or protocol error occurs.
+        """
+        try:
+            self.connection.sendall(cmd.encode() + CRLF)
+        except (
+            BrokenPipeError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+            TimeoutError,
+            OSError,
+        ) as e:
+            msg = f"FTP send error: {e}"
+            raise BlobError(msg) from e
+        return self._read_response()
+
+    def _expect(self, code: int) -> None:
+        """
+        Read the next FTP response and validate its reply code.
+
+        This helper ensures that the server response matches the expected
+        FTP reply code. It is used to enforce protocol correctness during
+        command execution sequences.
+
+        Args:
+            code: Expected FTP reply code.
+
+        Raises:
+            BlobError: If the received reply code differs from the expected
+                value or if a protocol/read error occurs while retrieving
+                the response.
+        """
+        got, _ = self._read_response()
+        if got != code:
+            msg = f"expected {code}, got {got}"
+            raise BlobError(msg)
+
+    @staticmethod
+    def _parse_pasv(line: bytes) -> tuple[str, int]:
+        """
+        Parse PASV response line and extract host/port.
+
+        Args:
+            line: Raw PASV response line.
+
+        Returns:
+            Tuple of (host, port).
+
+        Raises:
+            BlobError: If response format is invalid.
+        """
+        match = rx_pasv.search(line)
+        if not match:
+            msg = f"Invalid PASV response: {line!r}"
+            raise BlobError(msg)
+        h1, h2, h3, h4, p1, p2 = [
+            bytes_to_octet(x) for x in match.group(1).split(b",")
+        ]
+        host = f"{h1}.{h2}.{h3}.{h4}"
+        port = (p1 << 8) + p2
+        return host, port
+
+    def _get_passive_socket(self) -> socket.socket:
+        """
+        Enter passive mode and open FTP data connection.
+
+        Returns:
+            Data socket.
+
+        Raises:
+            BlobError: on error.
+        """
+        code, lines = self._cmd("PASV")
+        if code != FTP_PASV:
+            msg = f"PASV failed: {code}"
+            raise BlobError(msg)
+        host, port = self._parse_pasv(lines[-1])
+        try:
+            sock = socket.create_connection(
+                (host, port), timeout=self._timeout
+            )
+        except (TimeoutError, ConnectionRefusedError, OSError) as e:
+            msg = f"FTP data connection failed: {e}"
+            raise BlobError(msg) from e
+        return sock
+
+    def _pasv_cmd(self, cmd: str) -> bytes:
+        """
+        Execute command and read data from passive connection.
+
+        Args:
+            cmd: Command to send
+
+        Returns:
+            Received data
+
+        Raises:
+            BlobError: on error.
+        """
+        sock = self._get_passive_socket()
+        chunks: list[bytes] = []
+        try:
+            code, _ = self._cmd(cmd)
+            if code == FTP_NOT_FOUND:
+                raise KeyError(cmd.split(" ", 1)[-1])
+            if code not in (FTP_TRANSFER_ALREADY_OPEN, FTP_TRANSFER_READY):
+                msg = f"unexpected response: {code}"
+                raise BlobError(msg)
+            # Read data until server closes the connection or times out
+            while True:
+                try:
+                    if data := sock.recv(self._recv_size):
+                        chunks.append(data)
+                    else:
+                        break
+                except TimeoutError as e:
+                    with suppress(BlobError):
+                        self._expect(FTP_TRANSFER_DONE)
+                    msg = "timed out"
+                    raise BlobError(msg) from e
+                except OSError as e:
+                    with suppress(BlobError):
+                        self._expect(FTP_TRANSFER_DONE)
+                    msg = f"OS error: {e}"
+                    raise BlobError(msg) from e
+            self._expect(FTP_TRANSFER_DONE)
+        finally:
+            with suppress(OSError):
+                sock.shutdown(socket.SHUT_WR)
+            with suppress(OSError):
+                sock.close()
+        return b"".join(chunks)
+
+    def get(self, key: str) -> bytes:
+        """
+        Retrieve data by key.
+
+        Args:
+            key: Object key.
+
+        Raises:
+            BlobError: On backend or I/O failure.
+        """
+        return self._pasv_cmd(f"RETR {key}")
+
+    @staticmethod
+    def iter_parent_dirs(key: str) -> Iterable[str]:
+        """
+        Iterate all full paths to the parent.
+
+        Args:
+            key: current key.
+
+        Returns:
+            All full paths to the parent directories.
+        """
+        parts = key.strip("/").split("/")
+        current: list[str] = []
+        for part in parts[:-1]:
+            current.append(part)
+            yield "/".join(current)
+
+    def put(self, key: str, data: bytes) -> None:
+        """
+        Store binary data under the given key.
+
+        If the key already exists, its value is overwritten.
+
+        Args:
+            key: Object key.
+            data: Binary payload.
+
+        Raises:
+            BlobError: On backend or I/O failure.
+        """
+        sock = self._get_passive_socket()
+        try:
+            for d in self.iter_parent_dirs(key):
+                code, _ = self._cmd(f"MKD {d}")
+                if code not in (FTP_CREATED, FTP_NOT_FOUND):
+                    msg = f"cannot create {d}: {code}"
+                    raise BlobError(msg)
+            code, _ = self._cmd(f"STOR {key}")
+            if code not in (FTP_TRANSFER_ALREADY_OPEN, FTP_TRANSFER_READY):
+                msg = f"unexpected response: {code}"
+                raise BlobError(msg)
+            try:
+                sock.sendall(data)
+            except TimeoutError as e:
+                with suppress(BlobError):
+                    self._expect(FTP_TRANSFER_DONE)
+                msg = "timed out"
+                raise BlobError(msg) from e
+            except OSError as e:
+                with suppress(BlobError):
+                    self._expect(FTP_TRANSFER_DONE)
+                msg = f"OS error: {e}"
+                raise BlobError(msg) from e
+        finally:
+            with suppress(OSError):
+                sock.shutdown(socket.SHUT_WR)
+            with suppress(OSError):
+                sock.close()
+        self._expect(FTP_TRANSFER_DONE)
+
+    def delete(self, key: str) -> None:
+        """
+        Delete key.
+
+        Args:
+            key: Object key.
+
+        Raises:
+            KeyError: If the key does not exist.
+            BlobError: On backend or I/O failure.
+        """
+        code, _ = self._cmd(f"DELE {key}")
+        if code == FTP_NOT_FOUND:
+            raise KeyError(key)
+        if code != FTP_ACTION_OK:
+            msg = f"DELE failed: {code}"
+            raise BlobError(msg)
+
+    def exists(self, key: str) -> bool:
+        """Check whether a key exists in the blob store.
+
+        Uses MLST (RFC 3659) if the server supports it; falls back to
+        ``LIST <key>`` for servers that lack RFC 3659 support.
+
+        Args:
+            key: Object key.
+
+        Returns:
+            True if the key exists, False otherwise.
+
+        Raises:
+            BlobError: On backend or I/O failure.
+        """
+        if self.features.supports_size:
+            code, _ = self._cmd(f"SIZE {key}")
+            if code == FTP_SIZE_OK:
+                return True
+            if code == FTP_NOT_FOUND:
+                return False
+        if self.features.supports_mlst:
+            code, lines = self._cmd(f"MLST {key}")
+            if code == FTP_ACTION_OK:
+                return any(b"type=file" in line for line in lines)
+            if code == FTP_NOT_FOUND:
+                return False
+        # MLST returned something unexpected (e.g., 502 — command not
+        # supported). Fall back to scan()
+        return any(k == key for k in self.scan(key))
+
+    @cached_property
+    def features(self) -> FTPFeatures:
+        """
+        Get FTP server features.
+
+        Lazy evaluated on the first call of connection.
+        """
+        if self._pending_features:
+            return self._pending_features
+        code, lines = self._cmd("FEAT")
+        if code == FTP_STATUS:
+            # Server supports FEAT
+            return FTPFeatures.from_feat(lines)
+        return FTPFeatures()
+
+    def _scan(
+        self,
+        prefix: str,
+        cmd: str,
+        parser: Callable[[bytes], tuple[str, bool]],
+    ) -> Iterable[str]:
+        """
+        List remote keys using the given command.
+
+        This method uses given command to retrieve a
+        structured directory listing.
+
+        Only entries whose names start with the given prefix are returned.
+
+        Args:
+            prefix: Key prefix filter.
+            cmd: Command to retrieve data (LIST, MLSD, ...)
+            parser: Line parser, accepting line and returning
+                a tuple of (name, is directory)
+
+        Yields:
+            Matching object keys.
+
+        Raises:
+            BlobError: If the command fails or the data connection
+                cannot be established or read.
+        """
+
+        def list_dir(path: str, rest: list[str]) -> Iterable[str]:
+            path = path.rstrip("/")
+            try:
+                data = self._pasv_cmd(f"{cmd} {path}" if path else cmd)
+            except KeyError:
+                return
+            for line in data.splitlines():
+                name, is_dir = parser(line)
+                full_path = f"{path}/{name}" if path else name
+                if rest and name == rest[0] and is_dir:
+                    yield from list_dir(full_path, rest[1:])
+                elif rest and name == rest[0] and not is_dir:
+                    yield full_path
+                elif not rest and not is_dir:
+                    # scan("")
+                    yield full_path
+
+        parts = [p for p in prefix.split("/") if p]
+        yield from list_dir("", parts)
+
+    def scan(self, prefix: str) -> Iterable[str]:
+        """
+        Iterate all keys within prefix.
+
+        Args:
+            prefix: Prefix to scan.
+
+        Returns:
+            Yields matched keys.
+
+        Raises:
+            BlobError: On backend or I/O failure.
+        """
+        if self.features.supports_mlsd:
+            yield from self._scan(prefix, "MLSD", self._parse_mlsd_line)
+        else:
+            yield from self._scan(prefix, "LIST", self._parse_list_line)
+
+    @staticmethod
+    def _parse_mlsd_line(line: bytes) -> tuple[str, bool]:
+        """
+        Parse one line of MLSD output.
+
+        Args:
+            line: input line.
+
+        Returns:
+            Tuple of (file name, is directory)
+
+        Raises:
+            BlobError: on unparsable line.
+        """
+        parts = line.split(b";")
+        try:
+            name = parts[-1].lstrip(b" ").rstrip(b"/").decode()
+        except UnicodeDecodeError as e:
+            msg = f"failed to decode: {parts[-1]!r}"
+            raise BlobError(msg) from e
+        is_dir = any(p == b"type=dir" for p in parts[:-1])
+        return name, is_dir
+
+    @staticmethod
+    def _parse_list_line(line: bytes) -> tuple[str, bool]:
+        """
+        Parse one line of LIST output.
+
+        Args:
+            line: input line.
+
+        Returns:
+            Tuple of (file name, is directory)
+
+        Raises:
+            BlobError: on unparsable line.
+        """
+        if not rx_unix_perm.match(line):
+            msg = f"unrecognized format: {line!r}"
+            raise BlobError(msg)
+        try:
+            name = line.split()[-1].decode()
+        except UnicodeDecodeError as e:
+            msg = f"failed to decode: {line!r}"
+            raise BlobError(msg) from e
+        is_dir = line.startswith(b"d")
+        return name, is_dir
