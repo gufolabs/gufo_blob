@@ -61,6 +61,13 @@ def test_overwrite(url: str) -> None:
 
 
 @pytest.mark.parametrize("url", TEST_BACKENDS)
+def test_put_empty_data(url: str) -> None:
+    with prepare_blob(url) as b:
+        b.put("a", b"")
+        assert b.get("a") == b""
+
+
+@pytest.mark.parametrize("url", TEST_BACKENDS)
 def test_get_missing_key(url: str) -> None:
     with prepare_blob(url) as b, pytest.raises(KeyError):
         b.get("missing")

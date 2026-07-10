@@ -39,6 +39,14 @@ def test_overwrite(tmp_dir: Path) -> None:
     assert b.get("a") == b"456"
 
 
+def test_put_empty_data(tmp_dir: Path) -> None:
+    b = SQLiteBlob(tmp_dir / "blob.db")
+
+    b.put("empty", b"")
+
+    assert b.get("empty") == b""
+
+
 # ----------------------------------------------------------------------
 # KeyError semantics
 # ----------------------------------------------------------------------

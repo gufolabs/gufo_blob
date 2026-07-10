@@ -34,6 +34,15 @@ async def test_overwrite() -> None:
 
 
 @pytest.mark.asyncio
+async def test_put_empty_data() -> None:
+    b = MemoryBlob()
+
+    await b.put("empty", b"")
+
+    assert await b.get("empty") == b""
+
+
+@pytest.mark.asyncio
 async def test_get_missing_key() -> None:
     b = MemoryBlob()
 

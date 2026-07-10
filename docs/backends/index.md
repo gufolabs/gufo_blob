@@ -35,6 +35,7 @@ Backends may also differ in the scope of data visibility and sharing. Ordered fr
 | `memory` | Process lifetime | Process-local |
 | `file` | Host crash safety | Host-shared |
 | `sqlite` | Host-crash safety [^1] | Host-shared |
+| `ftp` | Host-crash safety [^1] | Network-distributed |
 
 ## Further reading
 
@@ -43,5 +44,6 @@ See appropriate backend documentation for implementation details.
 * [memory](memory.md)
 * [file](file.md)
 * [sqlite](sqlite.md)
+* [ftp](ftp.md)
 
 [^1]: Distributed file systems can increase durability.

@@ -66,6 +66,14 @@ async def test_overwrite(url: str) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("url", TEST_BACKENDS)
+async def test_put_empty_data(url: str) -> None:
+    async with prepare_blob(url) as b:
+        await b.put("a", b"")
+        assert await b.get("a") == b""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", TEST_BACKENDS)
 async def test_get_missing_key(url: str) -> None:
     async with prepare_blob(url) as b:
         with pytest.raises(KeyError):

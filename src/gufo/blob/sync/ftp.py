@@ -10,36 +10,37 @@
 from __future__ import annotations
 
 import random
-import re
 import socket
 import time
 from collections.abc import Callable, Iterable
 from contextlib import suppress
-from dataclasses import dataclass
 from functools import cached_property
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 # Gufo Blob modules
+from ..common.ftp import (
+    FTP_ACTION_OK,
+    FTP_CREATED,
+    FTP_LOGIN_OK,
+    FTP_NOT_FOUND,
+    FTP_OK,
+    FTP_PASV,
+    FTP_READY,
+    FTP_SIZE_OK,
+    FTP_STATUS,
+    FTP_TRANSFER_ALREADY_OPEN,
+    FTP_TRANSFER_DONE,
+    FTP_TRANSFER_READY,
+    FTP_USER_OK,
+    FTPFeatures,
+    parse_list_line,
+    parse_mlsd_line,
+    parse_pasv,
+)
 from ..error import BlobError
-from ..utils import bytes_to_int_range, bytes_to_octet
+from ..utils import bytes_to_int_range
 from .base import BlobBase
-
-# FTP reply codes
-FTP_TRANSFER_READY = 125
-FTP_TRANSFER_ALREADY_OPEN = 150
-FTP_OK = 200
-FTP_STATUS = 211
-FTP_SIZE_OK = 213
-FTP_READY = 220
-FTP_TRANSFER_DONE = 226
-FTP_PASV = 227
-FTP_LOGIN_OK = 230
-FTP_ACTION_OK = 250
-FTP_CREATED = 257
-FTP_USER_OK = 331
-FTP_UNAVAILABLE = 421
-FTP_NOT_FOUND = 550
 
 DEFAULT_USER = "anonymous"
 DEFAULT_PASSWORD = "anonymous@"  # noqa:S105
@@ -48,49 +49,6 @@ RETRY_RANGE = 0.2  # +- 10% of retry timeout
 CRLF = b"\r\n"
 RECV_SIZE = 65536
 MIN_FTP_RESPONSE = 4
-
-rx_pasv = re.compile(rb"\((\d+,\d+,\d+,\d+,\d+,\d+)\)")
-rx_unix_perm = re.compile(rb"[\-d]([\-r][\-w][\-x]){3}")
-
-
-@dataclass
-class FTPFeatures:
-    """
-    FTP Server features.
-
-    Attributes:
-        supports_mlsd: MLSD command is supported.
-        supports_mlst: MLST command is supported.
-        supports_size: SIZE command is supported.
-    """
-
-    supports_mlsd: bool = False
-    supports_mlst: bool = False
-    supports_size: bool = False
-
-    @classmethod
-    def from_feat(cls, feat: list[bytes]) -> FTPFeatures:
-        """
-        Parse FEAT response.
-
-        Args:
-            feat: Feat response from FTP server
-
-        Returns:
-            Parsed FTPFeatures.
-        """
-        features = cls()
-        for line in feat:
-            parts = line.split()
-            match parts[0].upper():
-                case b"MLSD":
-                    features.supports_mlst = True  # assumed with MLSD
-                    features.supports_mlsd = True
-                case b"SIZE":
-                    features.supports_size = True
-                case _:
-                    pass
-        return features
 
 
 class FTPBlob(BlobBase):
@@ -285,6 +243,33 @@ class FTPBlob(BlobBase):
             msg = f"Failed to set binary transfer mode: {code}"
             raise BlobError(msg)
 
+    def _read_line(self) -> bytes:
+        """
+        Read socket or buffer until CRLF.
+
+        Returns:
+            Line with stripped CRLF.
+        """
+        while True:
+            line, crlf, rest = self._response_buffer.partition(CRLF)
+            if crlf == CRLF:
+                self._response_buffer = rest
+                return line
+            try:
+                data = self.connection.recv(self._recv_size)
+            except TimeoutError as e:
+                msg = "timed out"
+                raise BlobError(msg) from e
+            except OSError as e:
+                msg = f"OS error: {e}"
+                raise BlobError(msg) from e
+            if not data:
+                msg = "server closed connection"
+                raise BlobError(msg)
+            self._response_buffer = (
+                self._response_buffer + data if self._response_buffer else data
+            )
+
     def _read_response(self) -> tuple[int, list[bytes]]:
         """
         Read a complete FTP server response.
@@ -303,37 +288,7 @@ class FTPBlob(BlobBase):
             BlobError: If the connection is closed, the response is
                 malformed, or a network error occurs.
         """
-
-        def read_line() -> bytes:
-            """
-            Read socket or buffer until CRLF.
-
-            Returns:
-                Line with stripped CRLF.
-            """
-            while True:
-                line, crlf, rest = self._response_buffer.partition(CRLF)
-                if crlf == CRLF:
-                    self._response_buffer = rest
-                    return line
-                try:
-                    data = self.connection.recv(self._recv_size)
-                except TimeoutError as e:
-                    msg = "timed out"
-                    raise BlobError(msg) from e
-                except OSError as e:
-                    msg = f"OS error: {e}"
-                    raise BlobError(msg) from e
-                if not data:
-                    msg = "server closed connection"
-                    raise BlobError(msg)
-                self._response_buffer = (
-                    self._response_buffer + data
-                    if self._response_buffer
-                    else data
-                )
-
-        lines: list[bytes] = [read_line()]
+        lines: list[bytes] = [self._read_line()]
         first = lines[0]
         if len(first) < MIN_FTP_RESPONSE:
             msg = "response too short"
@@ -341,7 +296,7 @@ class FTPBlob(BlobBase):
         code = bytes_to_int_range(first[:3], min_value=0, max_value=999)
         if first[3:4] == b"-":  # multi-line
             while True:
-                line = read_line()
+                line = self._read_line()
                 lines.append(line)
                 if (
                     len(line) >= MIN_FTP_RESPONSE
@@ -406,31 +361,6 @@ class FTPBlob(BlobBase):
             msg = f"expected {code}, got {got}"
             raise BlobError(msg)
 
-    @staticmethod
-    def _parse_pasv(line: bytes) -> tuple[str, int]:
-        """
-        Parse PASV response line and extract host/port.
-
-        Args:
-            line: Raw PASV response line.
-
-        Returns:
-            Tuple of (host, port).
-
-        Raises:
-            BlobError: If response format is invalid.
-        """
-        match = rx_pasv.search(line)
-        if not match:
-            msg = f"Invalid PASV response: {line!r}"
-            raise BlobError(msg)
-        h1, h2, h3, h4, p1, p2 = [
-            bytes_to_octet(x) for x in match.group(1).split(b",")
-        ]
-        host = f"{h1}.{h2}.{h3}.{h4}"
-        port = (p1 << 8) + p2
-        return host, port
-
     def _get_passive_socket(self) -> socket.socket:
         """
         Enter passive mode and open FTP data connection.
@@ -445,7 +375,7 @@ class FTPBlob(BlobBase):
         if code != FTP_PASV:
             msg = f"PASV failed: {code}"
             raise BlobError(msg)
-        host, port = self._parse_pasv(lines[-1])
+        host, port = parse_pasv(lines[-1])
         try:
             sock = socket.create_connection(
                 (host, port), timeout=self._timeout
@@ -700,54 +630,6 @@ class FTPBlob(BlobBase):
             BlobError: On backend or I/O failure.
         """
         if self.features.supports_mlsd:
-            yield from self._scan(prefix, "MLSD", self._parse_mlsd_line)
+            yield from self._scan(prefix, "MLSD", parse_mlsd_line)
         else:
-            yield from self._scan(prefix, "LIST", self._parse_list_line)
-
-    @staticmethod
-    def _parse_mlsd_line(line: bytes) -> tuple[str, bool]:
-        """
-        Parse one line of MLSD output.
-
-        Args:
-            line: input line.
-
-        Returns:
-            Tuple of (file name, is directory)
-
-        Raises:
-            BlobError: on unparsable line.
-        """
-        parts = line.split(b";")
-        try:
-            name = parts[-1].lstrip(b" ").rstrip(b"/").decode()
-        except UnicodeDecodeError as e:
-            msg = f"failed to decode: {parts[-1]!r}"
-            raise BlobError(msg) from e
-        is_dir = any(p == b"type=dir" for p in parts[:-1])
-        return name, is_dir
-
-    @staticmethod
-    def _parse_list_line(line: bytes) -> tuple[str, bool]:
-        """
-        Parse one line of LIST output.
-
-        Args:
-            line: input line.
-
-        Returns:
-            Tuple of (file name, is directory)
-
-        Raises:
-            BlobError: on unparsable line.
-        """
-        if not rx_unix_perm.match(line):
-            msg = f"unrecognized format: {line!r}"
-            raise BlobError(msg)
-        try:
-            name = line.split()[-1].decode()
-        except UnicodeDecodeError as e:
-            msg = f"failed to decode: {line!r}"
-            raise BlobError(msg) from e
-        is_dir = line.startswith(b"d")
-        return name, is_dir
+            yield from self._scan(prefix, "LIST", parse_list_line)

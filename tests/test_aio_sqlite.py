@@ -40,6 +40,15 @@ async def test_overwrite(tmp_dir: Path) -> None:
     assert await b.get("a") == b"456"
 
 
+@pytest.mark.asyncio
+async def test_put_empty_data(tmp_dir: Path) -> None:
+    b = SQLiteBlob(tmp_dir / "blob.db")
+
+    await b.put("empty", b"")
+
+    assert await b.get("empty") == b""
+
+
 # ----------------------------------------------------------------------
 # KeyError semantics
 # ----------------------------------------------------------------------

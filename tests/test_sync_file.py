@@ -30,6 +30,14 @@ def test_overwrite(tmp_dir: Path) -> None:
     assert b.get("a") == b"456"
 
 
+def test_put_empty_data(tmp_dir: Path) -> None:
+    b = FileBlob(str(tmp_dir))
+
+    b.put("empty", b"")
+
+    assert b.get("empty") == b""
+
+
 def test_missing_key_get(tmp_dir: Path) -> None:
     b = FileBlob(str(tmp_dir))
 
