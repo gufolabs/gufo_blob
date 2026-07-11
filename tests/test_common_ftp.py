@@ -10,6 +10,7 @@ import pytest
 # Gufo Blob modules
 from gufo.blob.common.ftp import (
     FTPFeatures,
+    iter_parent_dirs,
     parse_list_line,
     parse_mlsd_line,
     parse_pasv,
@@ -146,3 +147,18 @@ def test_parse_list_line(line: bytes, name: str, is_dir: bool) -> None:
 def test_parse_list_line_decode_error() -> None:
     with pytest.raises(BlobError):
         parse_list_line(b"-r--r--r-- \xff")
+
+
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        ("", []),
+        ("aaa", []),
+        ("aaa/bbb", ["aaa"]),
+        ("aaa/bbb/ccc", ["aaa", "aaa/bbb"]),
+        ("aaa/bbb/ccc/ddd", ["aaa", "aaa/bbb", "aaa/bbb/ccc"]),
+    ],
+)
+def test_iter_parent_dir(key: str, expected: list[str]) -> None:
+    r = list(iter_parent_dirs(key))
+    assert r == expected

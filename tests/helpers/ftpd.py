@@ -19,6 +19,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
+from urllib.parse import quote
 
 # Third-party modules
 import pytest
@@ -27,7 +28,9 @@ from pyftpdlib.handlers import FTPHandler
 from pyftpdlib.servers import FTPServer
 
 # Gufo Blob modules
-from gufo.blob.sync.ftp import FTPBlob, FTPFeatures
+from gufo.blob.aio.ftp import FTPBlob as AsyncFTPBlob
+from gufo.blob.common.ftp import FTPFeatures
+from gufo.blob.sync.ftp import FTPBlob as SyncFTPBlob
 
 
 @dataclass
@@ -49,10 +52,17 @@ class FTPInfo:
     user: str
     password: str
 
+    @property
+    def url(self) -> str:
+        """Build URL."""
+        user = quote(self.user, safe="")
+        password = quote(self.password, safe="")
+        return f"ftp://{user}:{password}@{self.host}:{self.port}/"
+
     @cached_property
-    def blob(self) -> FTPBlob:
+    def blob(self) -> SyncFTPBlob:
         """Get or create cached FTPBlob instance."""
-        return FTPBlob(
+        return SyncFTPBlob(
             host=self.host,
             port=self.port,
             user=self.user,
@@ -60,9 +70,9 @@ class FTPInfo:
             timeout=1.0,
         )
 
-    def blob_with_features(self, features: FTPFeatures) -> FTPBlob:
+    def blob_with_features(self, features: FTPFeatures) -> SyncFTPBlob:
         """Create blob with given features."""
-        return FTPBlob(
+        return SyncFTPBlob(
             host=self.host,
             port=self.port,
             user=self.user,
@@ -79,6 +89,28 @@ class FTPInfo:
             local_root=self.local_root,
             user=self.user,
             password=self.password,
+        )
+
+    @cached_property
+    def aio_blob(self) -> AsyncFTPBlob:
+        """Get or create cached FTPBlob instance."""
+        return AsyncFTPBlob(
+            host=self.host,
+            port=self.port,
+            user=self.user,
+            password=self.password,
+            timeout=1.0,
+        )
+
+    def aio_blob_with_features(self, features: FTPFeatures) -> AsyncFTPBlob:
+        """Create blob with given features."""
+        return AsyncFTPBlob(
+            host=self.host,
+            port=self.port,
+            user=self.user,
+            password=self.password,
+            timeout=1.0,
+            features=features,
         )
 
 

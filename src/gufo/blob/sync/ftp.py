@@ -34,6 +34,7 @@ from ..common.ftp import (
     FTP_TRANSFER_READY,
     FTP_USER_OK,
     FTPFeatures,
+    iter_parent_dirs,
     parse_list_line,
     parse_mlsd_line,
     parse_pasv,
@@ -444,23 +445,6 @@ class FTPBlob(BlobBase):
         """
         return self._pasv_cmd(f"RETR {key}")
 
-    @staticmethod
-    def iter_parent_dirs(key: str) -> Iterable[str]:
-        """
-        Iterate all full paths to the parent.
-
-        Args:
-            key: current key.
-
-        Returns:
-            All full paths to the parent directories.
-        """
-        parts = key.strip("/").split("/")
-        current: list[str] = []
-        for part in parts[:-1]:
-            current.append(part)
-            yield "/".join(current)
-
     def put(self, key: str, data: bytes) -> None:
         """
         Store binary data under the given key.
@@ -476,7 +460,7 @@ class FTPBlob(BlobBase):
         """
         sock = self._get_passive_socket()
         try:
-            for d in self.iter_parent_dirs(key):
+            for d in iter_parent_dirs(key):
                 code, _ = self._cmd(f"MKD {d}")
                 if code not in (FTP_CREATED, FTP_NOT_FOUND):
                     msg = f"cannot create {d}: {code}"

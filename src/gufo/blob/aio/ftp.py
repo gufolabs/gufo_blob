@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import random
-from collections.abc import AsyncIterator
+import socket
+from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
-from functools import cached_property
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -33,6 +34,7 @@ from ..common.ftp import (
     FTP_TRANSFER_READY,
     FTP_USER_OK,
     FTPFeatures,
+    iter_parent_dirs,
     parse_list_line,
     parse_mlsd_line,
     parse_pasv,
@@ -43,17 +45,29 @@ from .base import BlobBase
 
 DEFAULT_USER = "anonymous"
 DEFAULT_PASSWORD = "anonymous@"  # noqa: S105
-RETRY_RANGE = 0.2  # +- 10 % of retry timeout
+RETRY_RANGE = 0.2  # +- 10% of retry timeout
 CRLF = b"\r\n"
 RECV_SIZE = 65536
 MIN_FTP_RESPONSE = 4
 
 
-class AsyncFTPBlob(BlobBase):
-    """Async FTP blob backend using native `asyncio`.
+@dataclass
+class _Conn:
+    """Async FTP control connection wrapper."""
 
-    Stores objects as files on a remote FTP server (passive mode).
-    All operations use ``asyncio`` streams — never blocks the event loop.
+    reader: asyncio.StreamReader
+    writer: asyncio.StreamWriter
+
+    async def close(self) -> None:
+        self.writer.close()
+        await self.writer.wait_closed()
+
+
+class FTPBlob(BlobBase):
+    """Async FTP blob backend using native ``asyncio``.
+
+    Stores objects as files on a remote FTP server (passive mode). All
+    operations use ``asyncio`` streams and never block the event loop.
 
     Only passive mode is supported. Active mode (PORT/EPRT), TLS (FTPS),
     and resume operations (REST) are not implemented.
@@ -94,22 +108,18 @@ class AsyncFTPBlob(BlobBase):
         self._retries = retries
         self._retry_timeout = retry_timeout
         self._pending_features = features
-        self._reader: asyncio.StreamReader | None = None
-        self._writer: asyncio.StreamWriter | None = None
         self._response_buffer = b""
+        self._conn: _Conn | None = None
 
     @classmethod
     def parse_url(cls, url: str) -> dict[str, Any]:
-        """Parse an FTP URL into constructor kwargs.
+        """Parse FTP URL and extract parameters for constructor.
 
         Args:
-            url: ``ftp://[user:pass@]host[:port]/path``.
+            url: URL to parse.
 
         Returns:
-            Keyword arguments for :class:`AsyncFTPBlob(**kwargs)`.
-
-        Raises:
-            BlobError: If the hostname is missing from the URL.
+            **kwargs for constructor.
         """
         u = urlparse(url)
         if not u.hostname:
@@ -124,63 +134,55 @@ class AsyncFTPBlob(BlobBase):
         }
 
     async def open(self) -> None:
-        """Establish FTP connection and authenticate.
+        """Perform connection routines when necessary.
 
         Raises:
-            BlobError: On connection or authentication failure.
+            BlobError: on error.
         """
-        await self._connect_and_login()
+        _ = await self.connection  # Force connection
 
     async def close(self) -> None:
-        """Send QUIT and close the control connection."""
-        if self._writer is None:
-            return
-        writer = self._writer
-        self._writer = None
-        self._reader = None
+        """Perform cleanup routines when necessary."""
+        conn = self._conn
+        self._conn = None
         try:
             with suppress(BlobError):
                 await self._cmd("QUIT")
         finally:
+            if conn is not None:
+                await conn.close()
+
+    @property
+    async def connection(self) -> _Conn:
+        """Get connected reader and writer.
+
+        Returns:
+            Connected streams that have passed login.
+
+        Raises:
+            BlobError: on error.
+        """
+        if not self._conn:
+            reader, writer = await self._tcp_connect()
+            self._conn = _Conn(reader, writer)
             try:
-                writer.close()
-                await writer.wait_closed()
-            except OSError:
-                pass
-
-    async def _connect_and_login(self) -> None:
-        """Open TCP stream and complete login sequence."""
-        if self._writer is not None:
-            return  # already connected
-        conn = await self._tcp_connect()
-        reader, writer = conn
-        self._reader = reader
-        self._writer = writer
-        try:
-            await self._login()
-        except BlobError:
-            self._clear_transport()
-            raise
-
-    def _clear_transport(self) -> None:
-        """Abandon current transport without waiting."""
-        if self._writer is not None:
-            w = self._writer
-            self._writer = None
-            self._reader = None
-            with suppress(OSError):
-                w.close()
+                await self._login()
+            except BlobError:
+                await self._conn.close()
+                self._conn = None
+                raise
+        return self._conn
 
     async def _tcp_connect(
         self,
     ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        """Establish TCP connection to the FTP server with retries.
+        """Connect to FTP server.
 
         Returns:
-            ``(reader, writer)`` pair for control channel.
+            Connected reader/writer pair.
 
         Raises:
-            BlobError: After exhausting all retry attempts.
+            BlobError: on error.
         """
         last_error: str = ""
         for _ in range(self._retries):
@@ -196,14 +198,19 @@ class AsyncFTPBlob(BlobBase):
                 last_error = f"FTP connection refused: {e}"
             except OSError as e:
                 last_error = f"FTP OS error during connect: {e}"
-            offset = RETRY_RANGE * (random.random() - 0.5)  # noqa: S311
+            offset = RETRY_RANGE * (random.random() - 0.5)  # noqa: S311 not a crypto
             await asyncio.sleep(self._retry_timeout * (1.0 + offset))
         msg = f"failed to connect after {self._retries}: {last_error}"
         raise BlobError(msg)
 
     async def _login(self) -> None:
-        """Perform USER/PASS login and configure the session."""
+        """Perform login sequence.
+
+        Raises:
+            BlobError: on login failed.
+        """
         await self._expect(FTP_READY)
+        # Process USER
         code, _ = await self._cmd(f"USER {self._user}")
         if code == FTP_USER_OK:
             code, _ = await self._cmd(f"PASS {self._password}")
@@ -215,30 +222,27 @@ class AsyncFTPBlob(BlobBase):
             if code != FTP_ACTION_OK:
                 msg = f"CWD /{self._root} failed: {code}"
                 raise BlobError(msg)
-        # Set binary transfer mode for all subsequent data operations
+        # Set binary (image) transfer mode for all subsequent data operations
         code, _ = await self._cmd("TYPE I")
         if code != FTP_OK:
             msg = f"Failed to set binary transfer mode: {code}"
             raise BlobError(msg)
 
     async def _read_line(self) -> bytes:
-        """
-        Read socket or buffer until CRLF.
+        """Read socket or buffer until CRLF.
 
         Returns:
             Line with stripped CRLF.
         """
-        if self._reader is None:
-            msg = "not connected"
-            raise BlobError(msg)
         while True:
             line, crlf, rest = self._response_buffer.partition(CRLF)
             if crlf == CRLF:
                 self._response_buffer = rest
                 return line
             try:
+                reader = (await self.connection).reader
                 data = await asyncio.wait_for(
-                    self._reader.read(RECV_SIZE), timeout=self._timeout
+                    reader.read(RECV_SIZE), timeout=self._timeout
                 )
             except TimeoutError as e:
                 msg = "timed out"
@@ -246,7 +250,7 @@ class AsyncFTPBlob(BlobBase):
             except OSError as e:
                 msg = f"OS error: {e}"
                 raise BlobError(msg) from e
-            if not data and self._reader.at_eof():
+            if not data and reader.at_eof():
                 msg = "server closed connection"
                 raise BlobError(msg)
             self._response_buffer = (
@@ -256,13 +260,15 @@ class AsyncFTPBlob(BlobBase):
     async def _read_response(self) -> tuple[int, list[bytes]]:
         """Read a complete FTP server response.
 
-        Handles both single-line and multi-line replies per RFC 959.
+        Supports both single-line and multi-line responses as defined by
+        RFC 959. For multi-line responses, reading continues until the
+        terminating line with the same reply code followed by a space.
 
         Returns:
-            Tuple of (reply_code, list_of_lines_without_crlf).
+            A tuple containing reply code and list of lines without CRLF.
 
         Raises:
-            BlobError: On connection close or malformed response.
+            BlobError: on read or protocol error.
         """
         lines: list[bytes] = [await self._read_line()]
         first = lines[0]
@@ -270,7 +276,7 @@ class AsyncFTPBlob(BlobBase):
             msg = "response too short"
             raise BlobError(msg)
         code = bytes_to_int_range(first[:3], min_value=0, max_value=999)
-        if first[3:4] == b"-":
+        if first[3:4] == b"-":  # multi-line
             while True:
                 line = await self._read_line()
                 lines.append(line)
@@ -283,28 +289,25 @@ class AsyncFTPBlob(BlobBase):
         return code, lines
 
     async def _cmd(self, cmd: str) -> tuple[int, list[bytes]]:
-        """Send *cmd* on the control connection and read the reply.
+        """Send an FTP command and read the server response.
 
         Args:
-            cmd: FTP command string (trailing CRLF added automatically).
+            cmd: FTP command without the trailing CRLF.
 
         Returns:
-            ``(reply_code, lines)`` tuple.
+            Tuple of (reply_code, list_of_lines).
 
         Raises:
-            BlobError: On socket or protocol error.
+            BlobError: on send or protocol error.
         """
-        writer = self._writer
-        if writer is None:
-            msg = "not connected"
-            raise BlobError(msg)
         try:
-            writer.write(cmd.encode() + CRLF)
-            await asyncio.wait_for(writer.drain(), timeout=self._timeout)
+            conn = await self.connection
+            conn.writer.write(cmd.encode() + CRLF)
+            await asyncio.wait_for(conn.writer.drain(), timeout=self._timeout)
         except TimeoutError as e:
             msg = "timed out during send"
             raise BlobError(msg) from e
-        except OSError as e:
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
             msg = f"FTP send error: {e}"
             raise BlobError(msg) from e
         return await self._read_response()
@@ -326,13 +329,13 @@ class AsyncFTPBlob(BlobBase):
     async def _get_passive_connection(
         self,
     ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        """Enter PASV mode and open the data connection.
+        """Enter passive mode and open FTP data connection.
 
         Returns:
-            ``(reader, writer)`` pair for the data channel.
+            Data reader/writer pair.
 
         Raises:
-            BlobError: If PASV negotiation or data connect fails.
+            BlobError: on error.
         """
         code, lines = await self._cmd("PASV")
         if code != FTP_PASV:
@@ -344,81 +347,98 @@ class AsyncFTPBlob(BlobBase):
                 asyncio.open_connection(host, port),
                 timeout=self._timeout,
             )
-        except TimeoutError as e:
-            msg = f"FTP data connection failed: {e}"
-            raise BlobError(msg) from e
-        except OSError as e:
+        except (TimeoutError, ConnectionRefusedError, OSError) as e:
             msg = f"FTP data connection failed: {e}"
             raise BlobError(msg) from e
         return reader, writer
 
-    async def _drain_data(
-        self,
-        d_reader: asyncio.StreamReader,
-        d_writer: asyncio.StreamWriter,
-    ) -> bytes:
-        """Read all data from the PASV channel and expect 226.
+    async def _close_data(self, writer: asyncio.StreamWriter) -> None:
+        """Gracefully close FTP data connection.
 
-        Returns:
-            All bytes received on the data channel.
-
-        Raises:
-            BlobError: On timeout or network error.
+        Sends a half-close (SHUT_WR) so the server knows the client
+        has finished writing before the socket is fully closed. This
+        ensures proper 226/CODE response on the control channel for
+        STOR operations across all major FTP servers (vsftpd, ProFTPD,
+        etc.). For reading data (RETR, LIST, MLSD) the server already
+        sends FIN after completing the transfer, so SHUT_WR is best-
+        effort cleanup.
         """
-        chunks: list[bytes] = []
+        sock = writer.get_extra_info("socket")
+        if sock is not None:
+            with suppress(OSError):
+                sock.shutdown(socket.SHUT_WR)
         try:
-            while not d_reader.at_eof():
-                data = await asyncio.wait_for(
-                    d_reader.read(RECV_SIZE), timeout=self._timeout
-                )
-                if not data:
-                    break
-                chunks.append(data)
-        except TimeoutError as e:
-            with suppress(BlobError):
-                await self._expect(FTP_TRANSFER_DONE)
-            msg = "timed out"
-            raise BlobError(msg) from e
-        except OSError as e:
-            with suppress(BlobError):
-                await self._expect(FTP_TRANSFER_DONE)
-            msg = f"OS error: {e}"
-            raise BlobError(msg) from e
-        await self._expect(FTP_TRANSFER_DONE)
-        return b"".join(chunks)
-
-    async def _close_data_connection(
-        self,
-        d_writer: asyncio.StreamWriter,
-    ) -> None:
-        """Gracefully close the data connection writer."""
-        try:
-            d_writer.close()
-            await d_writer.wait_closed()
+            writer.close()
+            await writer.wait_closed()
         except OSError:
             pass
 
-    # ---- Blob API ----------------------------------------------------
-
-    async def put(self, key: str, data: bytes) -> None:
-        """Store binary data under *key*.
-
-        Creates intermediate remote directories automatically.  If the
-        key already exists, the value is overwritten.
+    async def _pasv_cmd(self, cmd: str) -> bytes:
+        """Execute command and read data from passive connection.
 
         Args:
-            key: Object key (remote file path).
-            data: Binary payload to persist.
+            cmd: Command to send on the control channel.
+
+        Returns:
+            Received data from the PASV data channel.
 
         Raises:
-            BlobError: On I/O or protocol error.
+            KeyError: If the server reports 550 (not found).
+            BlobError: on error.
+        """
+        d_reader, d_writer = await self._get_passive_connection()
+        chunks: list[bytes] = []
+        try:
+            code, _ = await self._cmd(cmd)
+            if code == FTP_NOT_FOUND:
+                raise KeyError(cmd.split(" ", 1)[-1])
+            if code not in (FTP_TRANSFER_ALREADY_OPEN, FTP_TRANSFER_READY):
+                msg = f"unexpected response: {code}"
+                raise BlobError(msg)
+            # Read data until server closes the connection or times out
+            while True:
+                try:
+                    data = await asyncio.wait_for(
+                        d_reader.read(RECV_SIZE), timeout=self._timeout
+                    )
+                    if data:
+                        chunks.append(data)
+                    else:
+                        break
+                except TimeoutError as e:
+                    with suppress(BlobError):
+                        await self._expect(FTP_TRANSFER_DONE)
+                    msg = "timed out"
+                    raise BlobError(msg) from e
+                except OSError as e:
+                    with suppress(BlobError):
+                        await self._expect(FTP_TRANSFER_DONE)
+                    msg = f"OS error: {e}"
+                    raise BlobError(msg) from e
+            await self._expect(FTP_TRANSFER_DONE)
+        finally:
+            await self._close_data(d_writer)
+        return b"".join(chunks)
+
+    async def put(self, key: str, data: bytes) -> None:
+        """Store binary data under the given key.
+
+        Creates intermediate remote directories automatically via
+        ``MKD``.  If the key already exists, its value is overwritten.
+
+        Args:
+            key: Object key (remote path).
+            data: Binary payload.
+
+        Raises:
+            BlobError: On backend or I/O failure.
         """
         _, d_writer = await self._get_passive_connection()
         try:
-            for parent in _iter_parent_dirs(key):
+            for parent in iter_parent_dirs(key):
                 code, _ = await self._cmd(f"MKD {parent}")
                 if code not in (FTP_CREATED, FTP_NOT_FOUND):
-                    msg = f"cannot create directory: {code}"
+                    msg = f"cannot create {parent}: {code}"
                     raise BlobError(msg)
             code, _ = await self._cmd(f"STOR {key}")
             if code not in (FTP_TRANSFER_ALREADY_OPEN, FTP_TRANSFER_READY):
@@ -438,43 +458,33 @@ class AsyncFTPBlob(BlobBase):
                 msg = f"OS error: {e}"
                 raise BlobError(msg) from e
         finally:
-            await self._close_data_connection(d_writer)
+            await self._close_data(d_writer)
         await self._expect(FTP_TRANSFER_DONE)
 
     async def get(self, key: str) -> bytes:
-        """Retrieve the full binary payload for *key*.
+        """Retrieve data by key.
 
         Args:
-            key: Object key (remote file path).
+            key: Object key.
 
         Returns:
-            The stored bytes.
+            Stored bytes.
 
         Raises:
-            KeyError: If the server reports ``550`` (file not found).
-            BlobError: On connection or protocol error.
+            KeyError: If the server reports 550 (file not found).
+            BlobError: On backend or I/O failure.
         """
-        d_reader, d_writer = await self._get_passive_connection()
-        try:
-            code, _ = await self._cmd(f"RETR {key}")
-            if code == FTP_NOT_FOUND:
-                raise KeyError(key)
-            if code not in (FTP_TRANSFER_ALREADY_OPEN, FTP_TRANSFER_READY):
-                msg = f"unexpected response: {code}"
-                raise BlobError(msg)
-            return await self._drain_data(d_reader, d_writer)
-        finally:
-            await self._close_data_connection(d_writer)
+        return await self._pasv_cmd(f"RETR {key}")
 
     async def delete(self, key: str) -> None:
-        """Delete the object at *key*.
+        """Delete key.
 
         Args:
-            key: Object key to remove.
+            key: Object key.
 
         Raises:
-            KeyError: If the server reports ``550`` (not found).
-            BlobError: On connection or protocol error.
+            KeyError: If the key does not exist.
+            BlobError: On backend or I/O failure.
         """
         code, _ = await self._cmd(f"DELE {key}")
         if code == FTP_NOT_FOUND:
@@ -483,158 +493,129 @@ class AsyncFTPBlob(BlobBase):
             msg = f"DELE failed: {code}"
             raise BlobError(msg)
 
-    async def exists(self, key: str) -> bool:
-        """Check whether *key* exists on the server.
+    @property
+    async def features(self) -> FTPFeatures:
+        """Get FTP server features.
 
-        Queries ``SIZE`` first (if supported), then ``MLST``, then
-        falls back to scanning with ``LIST`` (or ``MLSD``).
-
-        Args:
-            key: Object key to check.
+        Lazily probed via ``FEAT`` on first access after connection.
 
         Returns:
-            ``True`` if the key exists as a file, else ``False``.
+            Parsed :class:`FTPFeatures`.
+        """
+        if self._pending_features is not None:
+            return self._pending_features
+        code, lines = await self._cmd("FEAT")
+        if code == FTP_STATUS:
+            # Server supports FEAT -- cache parsed features
+            parsed = FTPFeatures.from_feat(lines)
+            self._pending_features = parsed
+            return parsed
+        # Server does not support FEAT -- all features disabled
+        self._pending_features = FTPFeatures()
+        return self._pending_features
+
+    async def exists(self, key: str) -> bool:
+        """Check whether a key exists on the server.
+
+        Uses SIZE first (if supported), then MLST, and falls back to
+        scanning via LIST when neither is available.
+
+        Args:
+            key: Object key.
+
+        Returns:
+            True if the key exists as a file, False otherwise.
 
         Raises:
-            BlobError: On connection or protocol error.
+            BlobError: On backend or I/O failure.
         """
-        if self.features.supports_size:
+        features = await self.features
+        if features.supports_size:
             code, _ = await self._cmd(f"SIZE {key}")
             if code == FTP_SIZE_OK:
                 return True
             if code == FTP_NOT_FOUND:
                 return False
-
-        if self.features.supports_mlst:
+        if features.supports_mlst:
             code, lines = await self._cmd(f"MLST {key}")
             if code == FTP_ACTION_OK:
                 return any(b"type=file" in line for line in lines)
             if code == FTP_NOT_FOUND:
                 return False
-
-        # Fallback: scan for the key
+        # MLST/SIZE unavailable -- fall back to scan
         async for k in self.scan(key):
             if k == key:
                 return True
         return False
 
-    @cached_property
-    def features(self) -> FTPFeatures:
-        """Server capabilities (lazy ``FEAT`` probe)."""
-        if self._pending_features is not None:
-            return self._pending_features
-        # NOTE: cached_property is sync; this only works after open()
-        loop = asyncio.get_event_loop()
-        code, lines = loop.run_until_complete(self._cmd("FEAT"))
-        if code == FTP_STATUS:
-            return FTPFeatures.from_feat(lines)
-        return FTPFeatures()
+    async def _scan(
+        self,
+        prefix: str,
+        cmd: str,
+        parser: Callable[[bytes], tuple[str, bool]],
+    ) -> AsyncIterator[str]:
+        """List remote keys using the given command.
+
+        Recursively walks directories that match the prefix, yielding
+        keys for matching file entries.
+
+        Args:
+            prefix: Key prefix filter.
+            cmd: Command to send (MLSD, LIST).
+            parser: Line parser returning (name, is_dir).
+
+        Yields:
+            Matching keys under *prefix*.
+
+        Raises:
+            BlobError: On connection/protocol error.
+        """
+
+        async def list_dir(path: str, rest: list[str]) -> AsyncIterator[str]:
+            path = path.rstrip("/")
+            try:
+                data = await self._pasv_cmd(f"{cmd} {path}" if path else cmd)
+            except KeyError:
+                return
+            for line in data.splitlines():
+                name, is_dir = parser(line)
+                full_path = f"{path}/{name}" if path else name
+                if rest and name == rest[0] and is_dir:
+                    async for k in list_dir(full_path, rest[1:]):
+                        yield k
+                elif not rest and not is_dir:
+                    # scan("") -- yield all files at root level
+                    yield full_path
+                elif rest and name == rest[0] and not is_dir:
+                    yield full_path
+
+        parts = [p for p in prefix.split("/") if p]
+        async for k in list_dir("", parts):
+            yield k
 
     def scan(self, prefix: str) -> AsyncIterator[str]:
-        """Yield all keys under *prefix* (recursive directory walk).
+        """Iterate all keys within prefix.
 
         Uses ``MLSD`` when available, falling back to ``LIST``.
 
         Args:
-            prefix: Key prefix filter.  Empty string scans root.
-
-        Yields:
-            Matching object keys as strings.
-
-        Raises:
-            BlobError: On connection or protocol error.
-        """
-        return self._scan_recursive("", prefix)
-
-    async def _scan_recursive(
-        self,
-        path: str,
-        prefix: str,
-    ) -> AsyncIterator[str]:
-        """Recursively walk the remote directory tree.
-
-        Args:
-            path: Current remote path (empty string = root).
-            prefix: Remaining key prefix to match against entries.
-
-        Yields:
-            Matching file paths as strings.
-        """
-        parts = [p for p in prefix.split("/") if p]
-        try:
-            data = await self._get_listing(path)
-        except KeyError:
-            return  # directory does not exist
-
-        for line in data.splitlines():
-            name, is_dir = _parse_line(line, self.features.supports_mlsd)
-            full = f"{path}/{name}" if path else name
-
-            if parts and name == parts[0] and is_dir:
-                async for k in self._scan_recursive(full, "/".join(parts[1:])):
-                    yield k
-            elif (parts and name == parts[0] and not is_dir) or (
-                not parts and not is_dir
-            ):
-                yield full
-
-    async def _get_listing(self, path: str) -> bytes:
-        """Retrieve directory listing via MLSD or LIST.
-
-        Args:
-            path: Remote directory (empty string = root).
+            prefix: Prefix to scan.  Empty string scans root.
 
         Returns:
-            Raw listing data as bytes.
+            Yields matched keys.
 
         Raises:
-            KeyError: If the server reports the path does not exist.
-            BlobError: On transfer failure.
+            BlobError: On backend or I/O failure.
         """
-        cmd_name = "MLSD" if self.features.supports_mlsd else "LIST"
-        ftp_cmd = f"{cmd_name} {path}" if path else cmd_name
 
-        d_reader, d_writer = await self._get_passive_connection()
-        try:
-            code, _ = await self._cmd(ftp_cmd)
-            if code == FTP_NOT_FOUND:
-                raise KeyError(path)
-            if code not in (FTP_TRANSFER_ALREADY_OPEN, FTP_TRANSFER_READY):
-                msg = f"unexpected response: {code}"
-                raise BlobError(msg)
-            return await self._drain_data(d_reader, d_writer)
-        finally:
-            await self._close_data_connection(d_writer)
+        async def _async_wrapper() -> AsyncIterator[str]:
+            # MLSD is preferred (structured RFC 3659 format)
+            features = await self.features
+            if features.supports_mlsd:
+                async for k in self._scan(prefix, "MLSD", parse_mlsd_line):
+                    yield k
+            else:
+                async for k in self._scan(prefix, "LIST", parse_list_line):
+                    yield k
 
-
-# ---- Module-level helpers (no instance needed) ----------------------
-
-
-def _iter_parent_dirs(key: str) -> list[str]:
-    """Return parent directory paths from root to immediate parent.
-
-    Example::
-
-        >>> list(_iter_parent_dirs("a/b/c.txt"))  # doctest: +SKIP
-        ["a", "a/b"]
-
-    Args:
-        key: Remote file path.
-
-    Returns:
-        List of ancestor directories in top-down order.
-    """
-    parts = key.strip("/").split("/")
-    current: list[str] = []
-    result: list[str] = []
-    for part in parts[:-1]:
-        current.append(part)
-        result.append("/".join(current))
-    return result
-
-
-def _parse_line(line: bytes, use_mlsd: bool) -> tuple[str, bool]:
-    """Dispatch to the appropriate parser based on MLSD support."""
-    if use_mlsd:
-        return parse_mlsd_line(line)
-    return parse_list_line(line)
+        return _async_wrapper()

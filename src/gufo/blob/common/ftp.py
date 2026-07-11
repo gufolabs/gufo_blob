@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 # Gufo Blob modules
@@ -146,3 +147,20 @@ def parse_mlsd_line(line: bytes) -> tuple[str, bool]:
         raise BlobError(msg) from e
     is_dir = any(p == b"type=dir" for p in parts[:-1])
     return name, is_dir
+
+
+def iter_parent_dirs(key: str) -> Iterable[str]:
+    """
+    Iterate all full paths to the parent.
+
+    Args:
+        key: current key.
+
+    Returns:
+        All full paths to the parent directories.
+    """
+    parts = key.strip("/").split("/")
+    current: list[str] = []
+    for part in parts[:-1]:
+        current.append(part)
+        yield "/".join(current)

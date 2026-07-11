@@ -4,6 +4,7 @@
 # Copyright (C) 2026, Gufo Labs
 # ---------------------------------------------------------------------
 
+
 # Third-party modules
 import pytest
 
@@ -128,21 +129,6 @@ def test_dict_api(ftpinfo: FTPInfo) -> None:
     del b["a"]
     with pytest.raises(KeyError):
         _ = b["a"]
-
-
-@pytest.mark.parametrize(
-    ("key", "expected"),
-    [
-        ("", []),
-        ("aaa", []),
-        ("aaa/bbb", ["aaa"]),
-        ("aaa/bbb/ccc", ["aaa", "aaa/bbb"]),
-        ("aaa/bbb/ccc/ddd", ["aaa", "aaa/bbb", "aaa/bbb/ccc"]),
-    ],
-)
-def test_iter_parent_dir(key: str, expected: list[str]) -> None:
-    r = list(FTPBlob.iter_parent_dirs(key))
-    assert r == expected
 
 
 @pytest.mark.parametrize(

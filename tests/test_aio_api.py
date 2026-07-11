@@ -18,15 +18,24 @@ from gufo.blob.aio.base import BlobBase
 
 from .utils import sort_async_iterable
 
-TEST_BACKENDS = [
-    "${TMP}",
-    "file://${TMP}",
-    "memory:///",
-    "sqlite:///${TMP}/blob.db",
-]
-
-
 V_TMP = "${TMP}"
+V_FTP = "ftp://${FTP}"
+
+
+@pytest.fixture(
+    params=[
+        "${TMP}",
+        "file://${TMP}",
+        "memory:///",
+        "sqlite:///${TMP}/blob.db",
+        "ftp://${FTP}",
+    ]
+)
+def blob_url(request: pytest.FixtureRequest, ftpinfo: FTPInfo) -> str:
+    url = request.param
+    if url == V_FTP:
+        return ftpinfo.url
+    return url
 
 
 @asynccontextmanager
@@ -48,59 +57,52 @@ async def prepare_blob(url: str) -> AsyncIterator[BlobBase]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("url", TEST_BACKENDS)
-async def test_put_and_get(url: str) -> None:
-    async with prepare_blob(url) as b:
+async def test_put_and_get(blob_url: str) -> None:
+    async with prepare_blob(blob_url) as b:
         await b.put("a", b"123")
         assert await b.get("a") == b"123"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("url", TEST_BACKENDS)
-async def test_overwrite(url: str) -> None:
-    async with prepare_blob(url) as b:
+async def test_overwrite(blob_url: str) -> None:
+    async with prepare_blob(blob_url) as b:
         await b.put("a", b"123")
         await b.put("a", b"456")
         assert await b.get("a") == b"456"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("url", TEST_BACKENDS)
-async def test_put_empty_data(url: str) -> None:
-    async with prepare_blob(url) as b:
+async def test_put_empty_data(blob_url: str) -> None:
+    async with prepare_blob(blob_url) as b:
         await b.put("a", b"")
         assert await b.get("a") == b""
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("url", TEST_BACKENDS)
-async def test_get_missing_key(url: str) -> None:
-    async with prepare_blob(url) as b:
+async def test_get_missing_key(blob_url: str) -> None:
+    async with prepare_blob(blob_url) as b:
         with pytest.raises(KeyError):
             await b.get("missing")
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("url", TEST_BACKENDS)
-async def test_delete_missing_key(url: str) -> None:
-    async with prepare_blob(url) as b:
+async def test_delete_missing_key(blob_url: str) -> None:
+    async with prepare_blob(blob_url) as b:
         with pytest.raises(KeyError):
             await b.delete("missing")
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("url", TEST_BACKENDS)
-async def test_exists_and_contains(url: str) -> None:
-    async with prepare_blob(url) as b:
+async def test_exists_and_contains(blob_url: str) -> None:
+    async with prepare_blob(blob_url) as b:
         assert not await b.exists("a")
         await b.put("a", b"1")
         assert await b.exists("a")
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("url", TEST_BACKENDS)
-async def test_delete(url: str) -> None:
-    async with prepare_blob(url) as b:
+async def test_delete(blob_url: str) -> None:
+    async with prepare_blob(blob_url) as b:
         await b.put("a", b"123")
         await b.delete("a")
         with pytest.raises(KeyError):
@@ -108,9 +110,8 @@ async def test_delete(url: str) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("url", TEST_BACKENDS)
-async def test_scan_prefix(url: str) -> None:
-    async with prepare_blob(url) as b:
+async def test_scan_prefix(blob_url: str) -> None:
+    async with prepare_blob(blob_url) as b:
         await b.put("a/1", b"x")
         await b.put("a/2", b"x")
         await b.put("b/1", b"x")
@@ -119,9 +120,8 @@ async def test_scan_prefix(url: str) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("url", TEST_BACKENDS)
-async def test_scan_empty_prefix_returns_all(url: str) -> None:
-    async with prepare_blob(url) as b:
+async def test_scan_empty_prefix_returns_all(blob_url: str) -> None:
+    async with prepare_blob(blob_url) as b:
         await b.put("a", b"x")
         await b.put("b", b"x")
         result = await sort_async_iterable(b.scan(""))
