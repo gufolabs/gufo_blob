@@ -10,6 +10,7 @@ Backends out of the box:
 | `memory` | In-process memory |
 | `file` | Local filesystem |
 | `sqlite` | SQLite database |
+| `ftp` | FTP server |
 
 ## Data durability
 

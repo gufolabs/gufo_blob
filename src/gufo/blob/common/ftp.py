@@ -64,6 +64,8 @@ class FTPFeatures:
         """
         features = cls()
         for line in feat:
+            if not line:
+                continue
             parts = line.split()
             match parts[0].upper():
                 case b"MLSD":

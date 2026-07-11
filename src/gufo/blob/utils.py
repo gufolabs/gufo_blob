@@ -63,7 +63,7 @@ def bytes_to_octet(x: bytes) -> int:
     """
     Convert string representation to octet value.
 
-    Arga:
+    Args:
         x: string representation
 
     Returns:

@@ -69,3 +69,9 @@ Schema: `ftp://`. The `parse_url` method extracts host, port (default 21), crede
     async with AsyncFTPBlob("ftp.example.com", user="user", password="pass", root="/webroot") as blob:
         ...
     ```
+
+## Compatibility
+
+FTP backend have been tested against:
+
+* pyftpdlib
