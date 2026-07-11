@@ -53,7 +53,7 @@ mkdocs gh-deploy --strict --force   # deploy
 
 1. Create `sync/<name>.py` implementing all abstract methods of the parent `BlobBase`. Use lazy connect pattern (`connection` property, double-checked locking) for file-based backends (see `sqlite.py`). For in-memory: use `threading.Lock` or `asyncio.Lock` as appropriate.
 2. Implement `parse_url(url: str) -> dict[str, Any]`. On unsupported schemas, raise `BlobError`. Validate identifiers against `[A-Za-z_][A-Za-z0-9_]*` if they become part of SQL/fs paths — reject invalid ones at construction time with `BlobError`.
-3. Create `aio/<name>.py` — prefer `AsyncWrapper[SyncBackend]` to avoid duplicating logic. For special async needs, use `asyncio.Lock` and snapshot-based iteration via `AsyncIterWrapper`.
+3. Create `aio/<name>.py` — prefer native async implementation over `AsyncWrapper[SyncBackend]`, use later only when async version is not available. Consider AsyncWrapper uses thread executor.
 4. Add tests: at minimum `put/get`, missing key (KeyError), exists/contains, scan prefix, and backend-specific edge cases.
 
 ## Dev tooling — run-dev CLI

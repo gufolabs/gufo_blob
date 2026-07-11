@@ -32,6 +32,14 @@ def test_overwrite() -> None:
     assert b.get("a") == b"456"
 
 
+def test_put_empty_data() -> None:
+    b = MemoryBlob()
+
+    b.put("empty", b"")
+
+    assert b.get("empty") == b""
+
+
 # ----------------------------------------------------------------------
 # KeyError semantics
 # ----------------------------------------------------------------------

@@ -16,15 +16,26 @@ import pytest
 from gufo.blob.sync import open_blob
 from gufo.blob.sync.base import BlobBase
 
-TEST_BACKENDS = [
-    "${TMP}",
-    "file://${TMP}",
-    "memory:///",
-    "sqlite:///${TMP}/blob.db",
-]
-
+from .helpers.ftpd import FTPInfo
 
 V_TMP = "${TMP}"
+V_FTP = "ftp://${FTP}"
+
+
+@pytest.fixture(
+    params=[
+        "${TMP}",
+        "file://${TMP}",
+        "memory:///",
+        "sqlite:///${TMP}/blob.db",
+        "ftp://${FTP}",
+    ]
+)
+def blob_url(request: pytest.FixtureRequest, ftpinfo: FTPInfo) -> str:
+    url = request.param
+    if url == V_FTP:
+        return ftpinfo.url
+    return url
 
 
 @contextmanager
@@ -45,42 +56,42 @@ def prepare_blob(url: str) -> Iterator[BlobBase]:
             yield blob
 
 
-@pytest.mark.parametrize("url", TEST_BACKENDS)
-def test_put_and_get(url: str) -> None:
-    with prepare_blob(url) as b:
+def test_put_and_get(blob_url: str) -> None:
+    with prepare_blob(blob_url) as b:
         b.put("a", b"123")
         assert b.get("a") == b"123"
 
 
-@pytest.mark.parametrize("url", TEST_BACKENDS)
-def test_overwrite(url: str) -> None:
-    with prepare_blob(url) as b:
+def test_overwrite(blob_url: str) -> None:
+    with prepare_blob(blob_url) as b:
         b.put("a", b"123")
         b.put("a", b"456")
         assert b.get("a") == b"456"
 
 
-@pytest.mark.parametrize("url", TEST_BACKENDS)
-def test_get_missing_key(url: str) -> None:
-    with prepare_blob(url) as b, pytest.raises(KeyError):
+def test_put_empty_data(blob_url: str) -> None:
+    with prepare_blob(blob_url) as b:
+        b.put("a", b"")
+        assert b.get("a") == b""
+
+
+def test_get_missing_key(blob_url: str) -> None:
+    with prepare_blob(blob_url) as b, pytest.raises(KeyError):
         b.get("missing")
 
 
-@pytest.mark.parametrize("url", TEST_BACKENDS)
-def test_delete_missing_key(url: str) -> None:
-    with prepare_blob(url) as b, pytest.raises(KeyError):
+def test_delete_missing_key(blob_url: str) -> None:
+    with prepare_blob(blob_url) as b, pytest.raises(KeyError):
         b.delete("missing")
 
 
-@pytest.mark.parametrize("url", TEST_BACKENDS)
-def test_delitem_missing_key(url: str) -> None:
-    with prepare_blob(url) as b, pytest.raises(KeyError):
+def test_delitem_missing_key(blob_url: str) -> None:
+    with prepare_blob(blob_url) as b, pytest.raises(KeyError):
         del b["missing"]
 
 
-@pytest.mark.parametrize("url", TEST_BACKENDS)
-def test_exists_and_contains(url: str) -> None:
-    with prepare_blob(url) as b:
+def test_exists_and_contains(blob_url: str) -> None:
+    with prepare_blob(blob_url) as b:
         assert not b.exists("a")
         assert "a" not in b
 
@@ -90,9 +101,8 @@ def test_exists_and_contains(url: str) -> None:
         assert "a" in b
 
 
-@pytest.mark.parametrize("url", TEST_BACKENDS)
-def test_delete(url: str) -> None:
-    with prepare_blob(url) as b:
+def test_delete(blob_url: str) -> None:
+    with prepare_blob(blob_url) as b:
         b.put("a", b"123")
         b.delete("a")
 
@@ -100,21 +110,17 @@ def test_delete(url: str) -> None:
             b.get("a")
 
 
-@pytest.mark.parametrize("url", TEST_BACKENDS)
-def test_scan_prefix(url: str) -> None:
-    with prepare_blob(url) as b:
+def test_scan_prefix(blob_url: str) -> None:
+    with prepare_blob(blob_url) as b:
         b.put("a/1", b"x")
         b.put("a/2", b"x")
         b.put("b/1", b"x")
-
         result = sorted(b.scan("a/"))
-
         assert result == ["a/1", "a/2"]
 
 
-@pytest.mark.parametrize("url", TEST_BACKENDS)
-def test_scan_empty_prefix_returns_all(url: str) -> None:
-    with prepare_blob(url) as b:
+def test_scan_empty_prefix_returns_all(blob_url: str) -> None:
+    with prepare_blob(blob_url) as b:
         b.put("a", b"x")
         b.put("b", b"x")
         result = sorted(b.scan(""))

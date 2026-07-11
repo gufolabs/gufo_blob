@@ -12,6 +12,10 @@ To see unreleased changes, please see the [CHANGELOG on the master branch](https
 
 ## [Unreleased]
 
+### Added
+
+* `ftp` backend.
+
 ### Infrastructure
 
 * Set up python tests in devcontainer
