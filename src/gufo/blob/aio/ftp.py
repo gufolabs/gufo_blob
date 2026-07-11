@@ -428,20 +428,15 @@ class FTPBlob(BlobBase):
             key: Key to put
 
         Raises:
-            BlobErorr: in case of errors.
+            BlobError: in case of errors.
         """
-        try:
-            for d in iter_parent_dirs(key):
-                code, _ = await self._cmd(f"MKD {d}")
-                if code not in (FTP_CREATED, FTP_NOT_FOUND):
-                    msg = f"cannot create {d}: {code}"
-                    raise BlobError(msg)
-        except TimeoutError as e:
-            msg = "timed out"
-            raise BlobError(msg) from e
-        except OSError as e:
-            msg = f"OS Error: {e}"
-            raise BlobError(msg) from e
+        # cmd raises only BlobError,
+        # so no additional exception catching
+        for d in iter_parent_dirs(key):
+            code, _ = await self._cmd(f"MKD {d}")
+            if code not in (FTP_CREATED, FTP_NOT_FOUND):
+                msg = f"cannot create {d}: {code}"
+                raise BlobError(msg)
 
     async def put(self, key: str, data: bytes) -> None:
         """Store binary data under the given key.
