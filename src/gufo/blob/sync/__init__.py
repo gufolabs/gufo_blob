@@ -12,6 +12,8 @@ Available out-of-the-box:
 * [MemoryBlob][gufo.blob.sync.memory.MemoryBlob]: Stores data in the
     process' memory
 * [FileBlob][gufo.blob.sync.file.FileBlob]: Host filesystem.
+* [SQLiteBlob][gufo.blob.sync.sqlite.SQLiteBlob]: SQLite database.
+* [FTPBlob][gufo.blob.sync.ftp.FTPBlob]: FTP server.
 """
 
 # Gufo Blob modules

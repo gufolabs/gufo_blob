@@ -20,6 +20,8 @@ from urllib.parse import unquote, urlparse
 
 # Gufo Blob modules
 from ..common.ftp import (
+    DEFAULT_PASSWORD,
+    DEFAULT_USER,
     FTP_ACTION_OK,
     FTP_CREATED,
     FTP_LOGIN_OK,
@@ -42,9 +44,6 @@ from ..common.ftp import (
 from ..error import BlobError
 from ..utils import bytes_to_int_range
 from .base import BlobBase
-
-DEFAULT_USER = "anonymous"
-DEFAULT_PASSWORD = "anonymous@"  # noqa:S105
 
 RETRY_RANGE = 0.2  # +- 10% of retry timeout
 CRLF = b"\r\n"
@@ -143,8 +142,8 @@ class FTPBlob(BlobBase):
         return {
             "host": u.hostname,
             "port": u.port or 21,
-            "user": unquote(u.username or "anonymous"),
-            "password": unquote(u.password or "anonymous@"),
+            "user": unquote(u.username or DEFAULT_USER),
+            "password": unquote(u.password or DEFAULT_PASSWORD),
             "root": u.path.strip("/"),
         }
 
@@ -445,6 +444,29 @@ class FTPBlob(BlobBase):
         """
         return self._pasv_cmd(f"RETR {key}")
 
+    def _ensure_parent_dirs(self, key: str) -> None:
+        """
+        Ensure all key's parent directories are exist.
+
+        Args:
+            key: Key to put
+
+        Raises:
+            BlobErorr: in case of errors.
+        """
+        try:
+            for d in iter_parent_dirs(key):
+                code, _ = self._cmd(f"MKD {d}")
+                if code not in (FTP_CREATED, FTP_NOT_FOUND):
+                    msg = f"cannot create {d}: {code}"
+                    raise BlobError(msg)
+        except TimeoutError as e:
+            msg = "timed out"
+            raise BlobError(msg) from e
+        except OSError as e:
+            msg = f"OS Error: {e}"
+            raise BlobError(msg) from e
+
     def put(self, key: str, data: bytes) -> None:
         """
         Store binary data under the given key.
@@ -458,13 +480,9 @@ class FTPBlob(BlobBase):
         Raises:
             BlobError: On backend or I/O failure.
         """
+        self._ensure_parent_dirs(key)
         sock = self._get_passive_socket()
         try:
-            for d in iter_parent_dirs(key):
-                code, _ = self._cmd(f"MKD {d}")
-                if code not in (FTP_CREATED, FTP_NOT_FOUND):
-                    msg = f"cannot create {d}: {code}"
-                    raise BlobError(msg)
             code, _ = self._cmd(f"STOR {key}")
             if code not in (FTP_TRANSFER_ALREADY_OPEN, FTP_TRANSFER_READY):
                 msg = f"unexpected response: {code}"

@@ -20,6 +20,8 @@ from urllib.parse import unquote, urlparse
 
 # Gufo Blob modules
 from ..common.ftp import (
+    DEFAULT_PASSWORD,
+    DEFAULT_USER,
     FTP_ACTION_OK,
     FTP_CREATED,
     FTP_LOGIN_OK,
@@ -43,8 +45,6 @@ from ..error import BlobError
 from ..utils import bytes_to_int_range
 from .base import BlobBase
 
-DEFAULT_USER = "anonymous"
-DEFAULT_PASSWORD = "anonymous@"  # noqa: S105
 RETRY_RANGE = 0.2  # +- 10% of retry timeout
 CRLF = b"\r\n"
 RECV_SIZE = 65536
@@ -420,6 +420,29 @@ class FTPBlob(BlobBase):
             await self._close_data(d_writer)
         return b"".join(chunks)
 
+    async def _ensure_parent_dirs(self, key: str) -> None:
+        """
+        Ensure all key's parent directories are exist.
+
+        Args:
+            key: Key to put
+
+        Raises:
+            BlobErorr: in case of errors.
+        """
+        try:
+            for d in iter_parent_dirs(key):
+                code, _ = await self._cmd(f"MKD {d}")
+                if code not in (FTP_CREATED, FTP_NOT_FOUND):
+                    msg = f"cannot create {d}: {code}"
+                    raise BlobError(msg)
+        except TimeoutError as e:
+            msg = "timed out"
+            raise BlobError(msg) from e
+        except OSError as e:
+            msg = f"OS Error: {e}"
+            raise BlobError(msg) from e
+
     async def put(self, key: str, data: bytes) -> None:
         """Store binary data under the given key.
 
@@ -433,13 +456,9 @@ class FTPBlob(BlobBase):
         Raises:
             BlobError: On backend or I/O failure.
         """
+        await self._ensure_parent_dirs(key)
         _, d_writer = await self._get_passive_connection()
         try:
-            for parent in iter_parent_dirs(key):
-                code, _ = await self._cmd(f"MKD {parent}")
-                if code not in (FTP_CREATED, FTP_NOT_FOUND):
-                    msg = f"cannot create {parent}: {code}"
-                    raise BlobError(msg)
             code, _ = await self._cmd(f"STOR {key}")
             if code not in (FTP_TRANSFER_ALREADY_OPEN, FTP_TRANSFER_READY):
                 msg = f"unexpected response: {code}"

@@ -32,6 +32,9 @@ FTP_USER_OK = 331
 FTP_UNAVAILABLE = 421
 FTP_NOT_FOUND = 550
 
+DEFAULT_USER = "anonymous"
+DEFAULT_PASSWORD = "anonymous@"  # noqa:S105
+
 rx_pasv = re.compile(rb"\((\d+,\d+,\d+,\d+,\d+,\d+)\)")
 rx_unix_perm = re.compile(rb"[\-d]([\-r][\-w][\-x]){3}")
 
