@@ -16,6 +16,7 @@ import pytest
 from gufo.blob.aio import open_blob
 from gufo.blob.aio.base import BlobBase
 
+from .helpers.ftpd import FTPInfo
 from .utils import sort_async_iterable
 
 V_TMP = "${TMP}"
