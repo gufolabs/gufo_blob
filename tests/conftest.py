@@ -12,16 +12,13 @@ from pathlib import Path
 # Third-party modules
 import pytest
 
-# helpers
+# helpers — auto-imported for pytest fixture discovery
 from .helpers.ftpd import ftpd, ftpinfo  # noqa: F401
+from .helpers.s3d import s3d, s3info  # noqa: F401
 
 
 @pytest.fixture
 def tmp_dir() -> Iterable[Path]:
-    """
-    Create a fresh temporary directory for each test.
-
-    The directory is automatically removed after test completion.
-    """
+    """Create a fresh temporary directory for each test."""
     with tempfile.TemporaryDirectory() as d:
         yield Path(d)

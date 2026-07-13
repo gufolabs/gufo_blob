@@ -9,4 +9,4 @@ RUN \
     && apt-get install -y --no-install-recommends git\
     && pip install --upgrade pip\
     && pip install --upgrade build\
-    && pip install -e .[test,lint,docs,ipython]
+    && pip install -e .[test,lint,docs,ipython,http]

@@ -14,6 +14,7 @@ Available out-of-the-box:
 * [FileBlob][gufo.blob.aio.file.FileBlob]: Host filesystem.
 * [SQLiteBlob][gufo.blob.aio.sqlite.SQLiteBlob]: SQLite database.
 * [FTPBlob][gufo.blob.aio.ftp.FTPBlob]: FTP server.
+* [S3Blob][gufo.blob.aio.s3.S3Blob]: S3-compatible storage.
 
 """
 
