@@ -14,6 +14,7 @@ Available out-of-the-box:
 * [FileBlob][gufo.blob.sync.file.FileBlob]: Host filesystem.
 * [SQLiteBlob][gufo.blob.sync.sqlite.SQLiteBlob]: SQLite database.
 * [FTPBlob][gufo.blob.sync.ftp.FTPBlob]: FTP server.
+* [S3Blob][gufo.blob.sync.s3.S3Blob]: S3-compatible storage.
 """
 
 # Gufo Blob modules
