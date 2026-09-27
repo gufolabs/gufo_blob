@@ -51,7 +51,7 @@ def s3d() -> Iterable[MotoServerInfo]:
 @pytest.fixture
 def s3info(s3d: MotoServerInfo) -> Iterable[S3Info]:
     access_key = "testing"
-    secret_key = "testing"
+    secret_key = "testing"  # noqa: S105
     endpoint_url = f"http://{s3d.host}:{s3d.port}"
 
     client = boto3.client(
@@ -87,7 +87,7 @@ def s3info(s3d: MotoServerInfo) -> Iterable[S3Info]:
 @pytest.fixture
 def s3info_with_prefix(s3d: MotoServerInfo) -> Iterable[S3Info]:
     access_key = "testing"
-    secret_key = "testing"
+    secret_key = "testing"  # noqa: S105
     endpoint_url = f"http://{s3d.host}:{s3d.port}"
 
     client = boto3.client(

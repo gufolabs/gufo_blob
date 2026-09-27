@@ -19,8 +19,10 @@ from gufo.http.async_client import HttpClient as AsyncClient
 from ..common.s3 import (
     S3_CREATED,
     S3_DELETED,
+    S3_NOT_FOUND,
     S3_OK,
     S3Error,
+    S3Response,
     S3Xml,
     parse_url,
     sign_request,
@@ -121,8 +123,7 @@ class S3Blob(BlobBase):
 
         base = self._endpoint.rstrip("/")
         return (
-            f"{base}/{self._bucket}?list-type=2"
-            f"&prefix={quote(full, safe='')}"
+            f"{base}/{self._bucket}?list-type=2&prefix={quote(full, safe='')}"
         )
 
     def _headers(
@@ -133,8 +134,7 @@ class S3Blob(BlobBase):
             url,
             body,
             self._region,
-            self._access_key,
-            self._secret_key,
+            (self._access_key, self._secret_key),
         )
 
     async def _request(
@@ -143,7 +143,7 @@ class S3Blob(BlobBase):
         method: str,
         url: str,
         body: bytes = b"",
-    ) -> Any:
+    ) -> S3Response:
         """Send one request and normalize transport errors."""
         try:
             headers = self._headers(method, url, body)
@@ -151,7 +151,8 @@ class S3Blob(BlobBase):
                 return await client.put(url, body, headers=headers)
             return await getattr(client, method.lower())(url, headers=headers)
         except Exception as ex:
-            raise BlobError(f"S3 request failed: {ex}") from ex
+            msg = f"S3 request failed: {ex}"
+            raise BlobError(msg) from ex
 
     async def _client(self) -> AsyncClient:
         """Create an HTTP client."""
@@ -196,7 +197,7 @@ class S3Blob(BlobBase):
             if resp.status == S3_OK:
                 return resp.content
             err = S3Error.from_xml(resp.content)
-            if resp.status == 404:
+            if resp.status == S3_NOT_FOUND:
                 raise KeyError(key) from err
             raise err
 
@@ -213,7 +214,7 @@ class S3Blob(BlobBase):
         url = self._endpoint_host(key)
         async with await self._client() as client:
             check = await self._request(client, "HEAD", url)
-            if check.status == 404:
+            if check.status == S3_NOT_FOUND:
                 err = S3Error.from_xml(check.content)
                 raise KeyError(key) from err
             if check.status != S3_OK:
@@ -243,7 +244,7 @@ class S3Blob(BlobBase):
             resp = await self._request(client, "HEAD", url)
             if resp.status == S3_OK:
                 return True
-            if resp.status == 404:
+            if resp.status == S3_NOT_FOUND:
                 return False
             raise S3Error.from_xml(resp.content)
 

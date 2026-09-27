@@ -11,9 +11,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import re
-import xml.parsers.expat
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import (
     parse_qs,
     parse_qsl,
@@ -22,6 +21,7 @@ from urllib.parse import (
     urlparse,
     urlsplit,
 )
+from xml.parsers import expat
 
 # Gufo Blob modules
 from ..error import BlobError
@@ -32,6 +32,7 @@ DEFAULT_REGION = "us-east-1"
 S3_OK = 200  # GET, HEAD success; scan page returned
 S3_CREATED = 200  # PUT object created / overwritten
 S3_DELETED = 204  # DELETE object removed safely
+S3_NOT_FOUND = 404
 
 # URL-safe characters for S3 key encoding (RFC 6901 + S3 spec)
 # https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html
@@ -42,28 +43,59 @@ S3_SAFE_CHARS = "-_.~!*()*'/"
 rx_bucket = re.compile(r"^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$")
 
 
-def _is_ns(tag: str, ns: str, name: str) -> bool:
-    """Match expat tag against namespace URI + local name.
+class S3Response(Protocol):
+    """Subset of an HTTP response used by the S3 backend."""
 
-    Expat emits expanded names as ``namespace}local`` when a namespace
-    separator is configured. This helper also matches bare names for
-    responses that omit namespaces.
+    status: int
+    content: bytes
 
-    Args:
-        tag: Tag string emitted by the expat handler.
-        ns: The S3 XML namespace URI.
-        name: Local element name (e.g. ``"Code"``).
 
-    Returns:
-         True when *tag* matches either format.
-    """
-    return tag == f"{ns}}}{name}" or tag == name
+def _parse_xml_fields(
+    body: bytes,
+    fields: set[tuple[str, ...]],
+) -> dict[tuple[str, ...], list[str]]:
+    """Parse selected element text from XML using Expat."""
+    values = {field: [] for field in fields}
+    path: list[str] = []
+    active_field: tuple[str, ...] | None = None
+    text: list[str] = []
+
+    def _local_name(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1]
+
+    def _start(tag: str, _attrs: dict[str, str]) -> None:
+        nonlocal active_field, text
+        path.append(_local_name(tag))
+        for field in fields:
+            if len(path) >= len(field) and tuple(path[-len(field) :]) == field:
+                active_field = field
+                text = []
+                break
+
+    def _data(value: str) -> None:
+        if active_field is not None:
+            text.append(value)
+
+    def _end(tag: str) -> None:
+        nonlocal active_field, text
+        if active_field is not None and path[-len(active_field) :] == list(
+            active_field
+        ):
+            values[active_field].append("".join(text))
+            active_field = None
+            text = []
+        path.pop()
+
+    parser = expat.ParserCreate("UTF-8", "}")
+    parser.StartElementHandler = _start
+    parser.CharacterDataHandler = _data
+    parser.EndElementHandler = _end
+    parser.Parse(body, True)
+    return values
 
 
 class S3Xml:
     """Parse XML responses from S3-compatible API."""
-
-    _NS = "http://s3.amazonaws.com/doc/2006-03-01/"
 
     @classmethod
     def list_objects(cls, body: bytes) -> tuple[list[str], str | None]:
@@ -78,63 +110,24 @@ class S3Xml:
         Raises:
             BlobError: on malformed XML response.
         """
-        keys: list[str] = []
-        key_buf: list[str] = []
-        token: str | None = None
-        token_buf: list[str] = []
-
-        in_contents = False
-        in_key = False
-        in_token = False
-
-        def _start(tag: str, _attrs: dict[str, str]) -> None:
-            nonlocal in_contents, in_key, in_token
-            if _is_ns(tag, cls._NS, "Contents"):
-                in_contents = True
-            elif in_contents and _is_ns(tag, cls._NS, "Key"):
-                in_key = True
-                key_buf.clear()
-            elif _is_ns(tag, cls._NS, "NextContinuationToken"):
-                in_token = True
-                token_buf.clear()
-
-        def _data(data: str) -> None:
-            if in_key:
-                key_buf.append(data)
-            elif in_token:
-                token_buf.append(data)
-
-        def _end(tag: str) -> None:
-            nonlocal in_contents, in_key, in_token, token
-            if in_key and _is_ns(tag, cls._NS, "Key"):
-                text = "".join(key_buf)
-                if text:
-                    keys.append(text)
-                in_key = False
-            elif in_token and _is_ns(tag, cls._NS, "NextContinuationToken"):
-                token = "".join(token_buf) or None
-                in_token = False
-            elif _is_ns(tag, cls._NS, "Contents"):
-                in_contents = False
-
-        parser = xml.parsers.expat.ParserCreate("UTF-8", "}")
-        parser.StartElementHandler = _start
-        parser.CharacterDataHandler = _data
-        parser.EndElementHandler = _end
+        fields = {
+            ("Contents", "Key"),
+            ("ListBucketResult", "NextContinuationToken"),
+        }
         try:
-            parser.Parse(body)
-        except xml.parsers.expat.ExpatError as ex:
-            raise BlobError(
-                f"Failed to parse S3 response: {ex.msg}",
-            ) from ex
+            values = _parse_xml_fields(body, fields)
+        except expat.ExpatError as ex:
+            msg = f"Failed to parse S3 response: {ex}"
+            raise BlobError(msg) from ex
 
+        keys = [key for key in values[("Contents", "Key")] if key]
+        tokens = values[("ListBucketResult", "NextContinuationToken")]
+        token = tokens[0] if tokens and tokens[0] else None
         return keys, token
 
 
 class S3Error:
     """Parse error responses from S3-compatible API."""
-
-    _NS = "http://s3.amazonaws.com/doc/2006-03-01/"
 
     @classmethod
     def from_xml(cls, body: bytes) -> BlobError:
@@ -146,46 +139,14 @@ class S3Error:
         Returns:
             BlobError with parsed message.
         """
-        code_parts: list[str] = []
-        msg_parts: list[str] = []
-        in_code = False
-        in_msg = False
-
-        def _start(tag: str, _attrs: dict[str, str]) -> None:
-            nonlocal in_code, in_msg
-            if _is_ns(tag, cls._NS, "Code") or tag == "Code":
-                in_code = True
-                code_parts.clear()
-            elif _is_ns(tag, cls._NS, "Message") or tag == "Message":
-                in_msg = True
-                msg_parts.clear()
-
-        def _data(data: str) -> None:
-            if in_code:
-                code_parts.append(data)
-            elif in_msg:
-                msg_parts.append(data)
-
-        def _end(tag: str) -> None:
-            nonlocal in_code, in_msg
-            if in_code and (_is_ns(tag, cls._NS, "Code") or tag == "Code"):
-                in_code = False
-            if in_msg and (
-                _is_ns(tag, cls._NS, "Message") or tag == "Message"
-            ):
-                in_msg = False
-
-        parser = xml.parsers.expat.ParserCreate("UTF-8", "}")
-        parser.StartElementHandler = _start
-        parser.CharacterDataHandler = _data
-        parser.EndElementHandler = _end
+        fields = {("Error", "Code"), ("Error", "Message")}
         try:
-            parser.Parse(body)
-        except xml.parsers.expat.ExpatError:
+            values = _parse_xml_fields(body, fields)
+        except expat.ExpatError:
             return BlobError("S3 returned an unparsable error response")
 
-        code = "".join(code_parts) or "Unknown"
-        message = "".join(msg_parts)
+        code = next(iter(values[("Error", "Code")]), "") or "Unknown"
+        message = next(iter(values[("Error", "Message")]), "")
         return BlobError(f"S3 error {code}: {message}")
 
 
@@ -243,10 +204,10 @@ def sign_request(
     url: str,
     body: bytes,
     region: str,
-    access_key: str | None,
-    secret_key: str | None,
+    credentials: tuple[str | None, str | None],
 ) -> dict[str, bytes]:
     """Create SigV4 headers when credentials are configured."""
+    access_key, secret_key = credentials
     if not access_key or not secret_key:
         return {}
 
