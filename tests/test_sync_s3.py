@@ -18,12 +18,12 @@ from .helpers.s3d import S3Info
 
 
 def _make_blob(s3info: S3Info) -> SyncS3Blob:
-   """Create a sync S3Blob for the given fixture."""
-   return SyncS3Blob(
-       bucket=s3info.bucket,
-       endpoint=s3info.endpoint,
-       access_key=s3info.access_key,
-       secret_key=s3info.secret_key,
+    """Create a sync S3Blob for the given fixture."""
+    return SyncS3Blob(
+        bucket=s3info.bucket,
+        endpoint=s3info.endpoint,
+        access_key=s3info.access_key,
+        secret_key=s3info.secret_key,
     )
 
 
@@ -47,6 +47,14 @@ def test_nested_put(s3info: S3Info) -> None:
         b.put(item, chr(n).encode())
     for n, item in enumerate(items):
         assert b.get(item) == chr(n).encode()
+
+
+def test_key_with_url_reserved_characters(s3info: S3Info) -> None:
+    b = _make_blob(s3info)
+    key = "dir/a #?% ü"
+    b.put(key, b"value")
+    assert b.get(key) == b"value"
+    assert list(b.scan("dir/")) == [key]
 
 
 def test_put_empty_data(s3info: S3Info) -> None:
@@ -90,13 +98,15 @@ def test_delete(s3info: S3Info) -> None:
         b.get("a")
 
 
-def test_scan_prefix(s3info: S3Info) -> None:
+def test_scan_prefix(s3info: S3Info, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MOTO_S3_DEFAULT_MAX_KEYS", "2")
     b = _make_blob(s3info)
     b.put("a/1", b"x")
     b.put("a/2", b"x")
+    b.put("a/3", b"x")
     b.put("b/1", b"x")
     result = sorted(b.scan("a/"))
-    assert result == ["a/1", "a/2"]
+    assert result == ["a/1", "a/2", "a/3"]
 
 
 def test_scan_empty_prefix_returns_all(s3info: S3Info) -> None:
@@ -123,10 +133,10 @@ def test_dict_api(s3info: S3Info) -> None:
 
 
 def test_from_url(s3info: S3Info) -> None:
-    blob = SyncS3Blob.from_url(
-        f"s3://testbucket/prefix?endpoint={s3info.endpoint}"
-    )
-    assert blob._prefix == "prefix"  # type: ignore[union-attr]
+    blob = SyncS3Blob.from_url(s3info.url(prefix="prefix"))
+    blob.put("key", b"value")
+    assert blob.get("key") == b"value"
+    assert list(blob.scan("")) == ["key"]
 
 
 def test_scan_with_prefix(s3info: S3Info) -> None:

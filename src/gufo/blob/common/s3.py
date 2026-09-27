@@ -8,10 +8,20 @@
 # Python modules
 from __future__ import annotations
 
+import hashlib
+import hmac
 import re
 import xml.parsers.expat
+from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import (
+    parse_qs,
+    parse_qsl,
+    quote,
+    unquote,
+    urlparse,
+    urlsplit,
+)
 
 # Gufo Blob modules
 from ..error import BlobError
@@ -19,9 +29,9 @@ from ..error import BlobError
 DEFAULT_REGION = "us-east-1"
 
 # S3 HTTP status codes
-S3_OK = 200              # GET, HEAD success; scan page returned
-S3_CREATED = 201         # PUT object created / overwritten
-S3_DELETED = 204         # DELETE object removed safely
+S3_OK = 200  # GET, HEAD success; scan page returned
+S3_CREATED = 200  # PUT object created / overwritten
+S3_DELETED = 204  # DELETE object removed safely
 
 # URL-safe characters for S3 key encoding (RFC 6901 + S3 spec)
 # https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html
@@ -35,10 +45,9 @@ rx_bucket = re.compile(r"^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$")
 def _is_ns(tag: str, ns: str, name: str) -> bool:
     """Match expat tag against namespace URI + local name.
 
-    When expat is created with ``namespace_prefixes=1``, tags appear as
-    the literal concatenation of the namespace URI and local name.  This
-    helper also matches against a bare *name* for responses that omit
-    namespaces entirely.
+    Expat emits expanded names as ``namespace}local`` when a namespace
+    separator is configured. This helper also matches bare names for
+    responses that omit namespaces.
 
     Args:
         tag: Tag string emitted by the expat handler.
@@ -48,7 +57,7 @@ def _is_ns(tag: str, ns: str, name: str) -> bool:
     Returns:
          True when *tag* matches either format.
     """
-    return tag == f"{ns}{name}" or tag == name
+    return tag == f"{ns}}}{name}" or tag == name
 
 
 class S3Xml:
@@ -57,9 +66,7 @@ class S3Xml:
     _NS = "http://s3.amazonaws.com/doc/2006-03-01/"
 
     @classmethod
-    def list_objects(
-        cls, body: bytes
-    ) -> tuple[list[str], str | None]:
+    def list_objects(cls, body: bytes) -> tuple[list[str], str | None]:
         """Parse ListObjectsV2 response.
 
         Args:
@@ -110,10 +117,7 @@ class S3Xml:
             elif _is_ns(tag, cls._NS, "Contents"):
                 in_contents = False
 
-        # Expat with namespace_prefixes=1 returns "urilocal" format
-        parser = xml.parsers.expat.ParserCreate(
-            "UTF-8", namespace_prefixes=1,
-        )
+        parser = xml.parsers.expat.ParserCreate("UTF-8", "}")
         parser.StartElementHandler = _start
         parser.CharacterDataHandler = _data
         parser.EndElementHandler = _end
@@ -171,9 +175,7 @@ class S3Error:
             ):
                 in_msg = False
 
-        parser = xml.parsers.expat.ParserCreate(
-            "UTF-8", namespace_prefixes=1,
-        )
+        parser = xml.parsers.expat.ParserCreate("UTF-8", "}")
         parser.StartElementHandler = _start
         parser.CharacterDataHandler = _data
         parser.EndElementHandler = _end
@@ -223,14 +225,9 @@ def parse_url(url: str) -> dict[str, Any]:
         msg = f"invalid bucket name: {bucket!r}"
         raise BlobError(msg)
 
-    prefix = (u.path or "").lstrip("/").replace("//", "/")
+    prefix = unquote((u.path or "").lstrip("/"))
     while "//" in prefix:
         prefix = prefix.replace("//", "/")
-    if prefix:
-        # S3 key path-safe characters
-        safe_chars = r"-_.~!*()*\/" + chr(39)
-        prefix = quote(prefix, safe=safe_chars)
-
     return {
         "bucket": bucket,
         "prefix": prefix,
@@ -238,6 +235,90 @@ def parse_url(url: str) -> dict[str, Any]:
         "region": region,
         "access_key": access_key or None,
         "secret_key": secret_key_val or None,
+    }
+
+
+def sign_request(
+    method: str,
+    url: str,
+    body: bytes,
+    region: str,
+    access_key: str | None,
+    secret_key: str | None,
+) -> dict[str, bytes]:
+    """Create SigV4 headers when credentials are configured."""
+    if not access_key or not secret_key:
+        return {}
+
+    now = datetime.now(timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date = now.strftime("%Y%m%d")
+    parsed = urlsplit(url)
+    host = parsed.netloc.lower()
+    payload_hash = hashlib.sha256(body).hexdigest()
+    headers = {
+        "host": host,
+        "x-amz-content-sha256": payload_hash,
+        "x-amz-date": amz_date,
+    }
+    canonical_headers = "".join(
+        f"{k}:{v}\n" for k, v in sorted(headers.items())
+    )
+    signed_headers = ";".join(sorted(headers))
+    canonical_uri = quote(unquote(parsed.path or "/"), safe="/-_.~")
+    query_items = sorted(
+        (
+            quote(k, safe="-_.~"),
+            quote(v, safe="-_.~"),
+        )
+        for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+    )
+    canonical_query = "&".join(f"{k}={v}" for k, v in query_items)
+    canonical_request = "\n".join(
+        (
+            method.upper(),
+            canonical_uri,
+            canonical_query,
+            canonical_headers,
+            signed_headers,
+            payload_hash,
+        )
+    )
+    scope = f"{date}/{region}/s3/aws4_request"
+    string_to_sign = "\n".join(
+        (
+            "AWS4-HMAC-SHA256",
+            amz_date,
+            scope,
+            hashlib.sha256(canonical_request.encode()).hexdigest(),
+        )
+    )
+
+    def _hmac(key: bytes, value: str) -> bytes:
+        return hmac.new(key, value.encode(), hashlib.sha256).digest()
+
+    signing_key = _hmac(
+        _hmac(
+            _hmac(
+                _hmac(("AWS4" + secret_key).encode(), date),
+                region,
+            ),
+            "s3",
+        ),
+        "aws4_request",
+    )
+    signature = hmac.new(
+        signing_key, string_to_sign.encode(), hashlib.sha256
+    ).hexdigest()
+    authorization = (
+        "AWS4-HMAC-SHA256 "
+        f"Credential={access_key}/{scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    return {
+        "x-amz-content-sha256": payload_hash.encode(),
+        "x-amz-date": amz_date.encode(),
+        "authorization": authorization.encode(),
     }
 
 
@@ -253,7 +334,7 @@ class S3Info:
         secret_key: AWS secret key (optional).
     """
 
-    def __init__(    # noqa: PLR0913
+    def __init__(  # noqa: PLR0913
         self,
         host: str,
         port: int,
@@ -283,7 +364,7 @@ class S3Info:
         p = prefix if prefix is not None else self.prefix
         parts: list[str] = [f"s3://{self.bucket}"]
         if p:
-            parts.append(p)
+            parts.append(f"/{quote(p.lstrip('/'), safe=S3_SAFE_CHARS)}")
         extras: list[str] = []
         if self.endpoint:
             extras.append(f"endpoint={self.endpoint}")

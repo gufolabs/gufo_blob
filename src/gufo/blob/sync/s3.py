@@ -23,7 +23,9 @@ from ..common.s3 import (
     S3Error,
     S3Xml,
     parse_url,
+    sign_request,
 )
+from ..error import BlobError
 from .base import BlobBase
 
 
@@ -61,6 +63,9 @@ class S3Blob(BlobBase):
         self._region = region
         self._access_key = access_key
         self._secret_key = secret_key
+        if bool(access_key) != bool(secret_key):
+            msg = "access_key and secret_key must be provided together"
+            raise BlobError(msg)
 
     @classmethod
     def parse_url(cls, url: str) -> dict[str, Any]:
@@ -93,7 +98,8 @@ class S3Blob(BlobBase):
             full_key = f"{self._prefix}{key}" if key else self._prefix
         else:
             full_key = key
-        return f"{base}/{self._bucket}/{full_key}".rstrip("/")
+        escaped_key = quote(full_key, safe="/-_.~")
+        return f"{base}/{self._bucket}/{escaped_key}"
 
     def _list_url(self, prefix: str) -> str:
         """Build ListObjectsV2 URL.
@@ -114,8 +120,37 @@ class S3Blob(BlobBase):
 
         base = self._endpoint.rstrip("/")
         return (
-            f"{base}/{self._bucket}?list-type=2&prefix={quote(full, safe='')}"
+            f"{base}/{self._bucket}?list-type=2"
+            f"&prefix={quote(full, safe='')}"
         )
+
+    def _headers(
+        self, method: str, url: str, body: bytes = b""
+    ) -> dict[str, bytes]:
+        return sign_request(
+            method,
+            url,
+            body,
+            self._region,
+            self._access_key,
+            self._secret_key,
+        )
+
+    def _request(
+        self,
+        client: SyncClient,
+        method: str,
+        url: str,
+        body: bytes = b"",
+    ) -> Any:
+        """Send one request and normalize transport errors."""
+        try:
+            headers = self._headers(method, url, body)
+            if method == "PUT":
+                return client.put(url, body, headers=headers)
+            return getattr(client, method.lower())(url, headers=headers)
+        except Exception as ex:
+            raise BlobError(f"S3 request failed: {ex}") from ex
 
     def _client(self) -> SyncClient:
         """Create or reuse an HTTP client."""
@@ -135,8 +170,8 @@ class S3Blob(BlobBase):
         """
         url = self._endpoint_host(key)
         with self._client() as client:
-            resp = client.put(url, data=data)
-            if resp.status_code == S3_CREATED:
+            resp = self._request(client, "PUT", url, data)
+            if resp.status == S3_CREATED:
                 return
             err = S3Error.from_xml(resp.content)
             raise err
@@ -156,11 +191,13 @@ class S3Blob(BlobBase):
         """
         url = self._endpoint_host(key)
         with self._client() as client:
-            resp = client.get(url)
-            if resp.status_code == S3_OK:
+            resp = self._request(client, "GET", url)
+            if resp.status == S3_OK:
                 return resp.content
             err = S3Error.from_xml(resp.content)
-            raise KeyError(key) from err
+            if resp.status == 404:
+                raise KeyError(key) from err
+            raise err
 
     def delete(self, key: str) -> None:
         """Delete key.
@@ -174,11 +211,17 @@ class S3Blob(BlobBase):
         """
         url = self._endpoint_host(key)
         with self._client() as client:
-            resp = client.delete(url)
-            if resp.status_code == S3_DELETED:
+            check = self._request(client, "HEAD", url)
+            if check.status == 404:
+                err = S3Error.from_xml(check.content)
+                raise KeyError(key) from err
+            if check.status != S3_OK:
+                raise S3Error.from_xml(check.content)
+            resp = self._request(client, "DELETE", url)
+            if resp.status == S3_DELETED:
                 return
             err = S3Error.from_xml(resp.content)
-            raise KeyError(key) from err
+            raise err
 
     def exists(self, key: str) -> bool:
         """Check whether a key exists in the blob store.
@@ -196,8 +239,12 @@ class S3Blob(BlobBase):
         """
         url = self._endpoint_host(key)
         with self._client() as client:
-            resp = client.head(url)
-            return resp.status_code == S3_OK
+            resp = self._request(client, "HEAD", url)
+            if resp.status == S3_OK:
+                return True
+            if resp.status == 404:
+                return False
+            raise S3Error.from_xml(resp.content)
 
     def scan(self, prefix: str) -> Iterable[str]:
         """Iterate all keys within prefix.
@@ -216,8 +263,8 @@ class S3Blob(BlobBase):
         url = self._list_url(prefix)
         with self._client() as client:
             while True:
-                resp = client.get(url)
-                if resp.status_code != S3_OK:
+                resp = self._request(client, "GET", url)
+                if resp.status != S3_OK:
                     err = S3Error.from_xml(resp.content)
                     raise err
 
@@ -228,8 +275,10 @@ class S3Blob(BlobBase):
                     yield stripped
 
                 if token:
+                    continuation = quote(token, safe="")
                     url = (
-                        f"{self._list_url(prefix)}&continuation-token={token}"
+                        f"{self._list_url(prefix)}"
+                        f"&continuation-token={continuation}"
                     )
                 else:
                     break

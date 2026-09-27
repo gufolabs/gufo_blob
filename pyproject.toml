@@ -161,7 +161,7 @@ lint = [
 ]
 test = [
 	"boto3>=1.35.0",
-	"moto[s3]>=5.0.0",
+	"moto[s3,server]>=5.0.0",
 	"PyYAML>=6.0",
 	"pytest-benchmark==5.1.0",
 	"pytest-cov==7.0.0",
