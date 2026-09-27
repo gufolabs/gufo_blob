@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import re
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Any, Protocol
 from urllib.parse import (
@@ -46,16 +47,24 @@ rx_bucket = re.compile(r"^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$")
 class S3Response(Protocol):
     """Subset of an HTTP response used by the S3 backend."""
 
-    status: int
-    content: bytes
+    @property
+    def status(self) -> int:
+        """Return the HTTP status code."""
+        ...
+
+    @property
+    def content(self) -> bytes:
+        """Return the response body."""
+        ...
 
 
 def _parse_xml_fields(
     body: bytes,
-    fields: set[tuple[str, ...]],
+    fields: Iterable[tuple[str, ...]],
 ) -> dict[tuple[str, ...], list[str]]:
     """Parse selected element text from XML using Expat."""
-    values = {field: [] for field in fields}
+    fields = tuple(fields)
+    values: dict[tuple[str, ...], list[str]] = {field: [] for field in fields}
     path: list[str] = []
     active_field: tuple[str, ...] | None = None
     text: list[str] = []

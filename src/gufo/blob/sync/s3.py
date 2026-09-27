@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote
 
 # Third-party modules
@@ -148,7 +148,8 @@ class S3Blob(BlobBase):
             headers = self._headers(method, url, body)
             if method == "PUT":
                 return client.put(url, body, headers=headers)
-            return getattr(client, method.lower())(url, headers=headers)
+            response = getattr(client, method.lower())(url, headers=headers)
+            return cast(S3Response, response)
         except Exception as ex:
             msg = f"S3 request failed: {ex}"
             raise BlobError(msg) from ex
