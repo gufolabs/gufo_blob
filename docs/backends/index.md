@@ -11,6 +11,7 @@ Backends out of the box:
 | `file` | Local filesystem |
 | `sqlite` | SQLite database |
 | `ftp` | FTP server |
+| `s3` | S3-compatible object storage |
 
 ## Data durability
 
@@ -37,6 +38,7 @@ Backends may also differ in the scope of data visibility and sharing. Ordered fr
 | `file` | Host crash safety | Host-shared |
 | `sqlite` | Host-crash safety [^1] | Host-shared |
 | `ftp` | Host-crash safety [^1] | Network-distributed |
+| `s3` | Service-dependent | Network-distributed |
 
 ## Further reading
 
@@ -46,5 +48,6 @@ See appropriate backend documentation for implementation details.
 * [file](file.md)
 * [sqlite](sqlite.md)
 * [ftp](ftp.md)
+* [s3](s3.md)
 
 [^1]: Distributed file systems can increase durability.
